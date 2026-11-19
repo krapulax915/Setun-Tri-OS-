@@ -160,8 +160,8 @@ class TestTritwise(unittest.TestCase):
                                            for x, y in zip(ta, tb)]))
             self.assertEqual(T.tmul(a, b), T.from_trits([x * y for x, y in zip(ta, tb)]))
             self.assertEqual(T.tinv(a), T.from_trits([-x for x in ta]))
-            # identities
-            self.assertEqual(T.tmin(a, T.tinv(b)), T.tmax(a, b) if False else T.tmin(a, T.tinv(b)))
+            # De Morgan for ternary min/max under trit negation
+            self.assertEqual(T.tmin(a, T.tinv(b)), T.tinv(T.tmax(T.tinv(a), b)))
             self.assertEqual(T.tinv(T.tinv(a)), a)
             self.assertEqual(T.tsum(a, T.tinv(a)), 0)
             self.assertEqual(T.tcons(a, a), a)
@@ -198,7 +198,7 @@ class TestShifts(unittest.TestCase):
             t = T.to_trits(v, 18)
             want = T.from_trits(t[(k % 18):] + t[:(k % 18)])
             self.assertEqual(T.brot(v, k), want)
-        self.assertEqual(T.brot(v if False else 1, 1), 3)  # (+) LSB trit moves up one
+        self.assertEqual(T.brot(1, 1), 3)  # lowest trit moves up one
         self.assertEqual(T.brot(1, 0), 1)
         self.assertEqual(T.brot(T.WORD_MAX, 18), T.WORD_MAX)
 

@@ -2,6 +2,31 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M2 — 2026-11-19 — Devices, boot ROM, debugger
+- `tools/tvm/devices.py`: UART (TX/RX/STAT, TriText output stream with escape
+  decoding), BlockDevice (file-backed, 729-tryte blocks, read/write commands +
+  completion IRQs), deterministic ternary LCG RNG, power/reset device, profiler
+  register stubs (M9). MMIO map per D-011 with explicit offset routing.
+- `tools/tvm/machine.py`: Machine — CPU + RAM + MMIO bus + devices + ROM loading;
+  bare-metal trap fallback; clean power-off/exit codes; disk image load/save
+  (5 trits/byte, host-side only).
+- `tools/trild.py`: TXE linker (merged spans, symbols, entry; checksum D-014).
+- `tools/trimkfs.py`: raw boot image builder (block 0 = boot sector, 1.. = TXE).
+- `boot/rom.asm`: ROM loads disk block 0 to RAM 6561 and jumps to it.
+- `boot/boot.asm`: boot sector reads kernel TXE (blocks 1..27) into the buffer,
+  parses magic/version/entry/segments tryte-wise (unaligned-safe), copies
+  segments, jumps to entry.
+- `kernel/kernel.asm`: M2 stub kernel — UART greeting, clean power-off.
+- `lib/trilib.asm`: shared macros (const via LUI+ADDI with balanced rounding,
+  push/pop/call/ret).
+- `tools/tridbg.py`: debugger — step/run/breakpoints/regs/mem/dis/trace/out.
+- `python tools/mk.py assemble|image|run` boots the TVM end to end:
+  "Hello, ternary world!" on UART, exit 0.
+- Tests: 84 green — packing round-trips, TXE checksum corruption detection,
+  UART in/out, block device MMIO round-trip + error case, RNG determinism,
+  power device, full boot path, boot failure prints 'E' on bad magic,
+  debugger step/break/trace.
+
 ## M1 — 2026-11-19 — Assembler + TVM CPU core
 - `tools/triasm.py`: two-pass symbolic assembler — labels, macros (%arg substitution,
   nested invocations), .include, .org/.entry/.globl/.equ/.tryte/.word/.ascii/.asciz/.space/.align;

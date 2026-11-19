@@ -145,20 +145,30 @@ def isa_doc(args):
     return 0
 
 
+BOOT_SRC_PATH = os.path.join(REPO, "boot", "boot.asm")
+
+
 @target
 def assemble(args):
     ensure_build_dir()
-    from triasm import assemble_file
+    import triasm
+    import trild
     made = []
     # boot ROM (M2)
     if os.path.exists(ROM_SRC_PATH):
-        rom = assemble_file(ROM_SRC_PATH, org=0, rom=True)
-        write_bytes("build/rom.tri", rom.to_bytes())
+        rom = triasm.assemble_file(ROM_SRC_PATH, org=0, rom=True)
+        write_bytes("build/rom.tri", rom.rom_bytes)
         made.append("rom.tri")
-    # kernel (M3+)
+    # boot sector program (M2)
+    if os.path.exists(BOOT_SRC_PATH):
+        bimg = triasm.assemble_file(BOOT_SRC_PATH)
+        write_bytes("build/boot.tri", bimg.to_bytes())
+        made.append("boot.tri")
+    # kernel -> TXE (M2+)
     if os.path.exists(KERNEL_SRC_PATH):
-        kimg = assemble_file(KERNEL_SRC_PATH)
-        write_bytes("build/kernel.txe", kimg)
+        kimg = triasm.assemble_file(KERNEL_SRC_PATH)
+        txe = trild.link_txe([kimg])
+        write_bytes("build/kernel.txe", txe)
         made.append("kernel.txe")
     print("assembled: %s" % (", ".join(made) if made else "(nothing yet)"))
     return 0
@@ -171,9 +181,15 @@ def run(args):
     for arg in args:
         if arg.startswith("IMAGE=") or arg.startswith("DISK="):
             img = safe_repo_path(arg.split("=", 1)[1], must_exist=True)
+    rom_bytes = Path(ROM_OUT_PATH).read_bytes() if os.path.exists(ROM_OUT_PATH) else None
+    if rom_bytes is None:
+        raise SystemExit("build/rom.tri missing — run: python tools/mk.py assemble")
     from tvm.machine import Machine
-    m = Machine(disk_path=img if os.path.exists(img) else None)
-    return m.run()
+    m = Machine(rom_bytes=rom_bytes,
+                disk_path=img if os.path.exists(img) else None, echo=True)
+    code = m.run()
+    sys.stdout.flush()
+    return code
 
 
 @target
@@ -183,18 +199,20 @@ def image(args):
     for arg in args:
         if arg.startswith("OUT="):
             out = safe_repo_path(arg.split("=", 1)[1])
-    from trimkfs import mkfs_and_populate
-    files = {}
-    if os.path.isdir(POPULATE_DIR):
-        for name in sorted(os.listdir(POPULATE_DIR)):
-            if not safe_entry_name(name):
-                continue  # skip anything that is not a plain repo-local file name
-            p = os.path.join(POPULATE_DIR, name)
-            if os.path.isfile(p):
-                with open(p, "rb") as f:
-                    files[name] = f.read()
-    mkfs_and_populate(out, files)
-    print("wrote %s" % out)
+    import triasm
+    import trimkfs
+    import pack as packmod
+    boot_img = triasm.assemble_file(BOOT_SRC_PATH)
+    spans = boot_img.spans()
+    boot_trytes = spans[0][1] if spans else []
+    kernel_txe = Path(KERNEL_OUT_PATH).read_bytes() if os.path.exists(KERNEL_OUT_PATH) \
+        else None
+    if kernel_txe is None:
+        raise SystemExit("build/kernel.txe missing — run: python tools/mk.py assemble")
+    payload = packmod.unpack_trytes(kernel_txe)
+    trimkfs.write_boot_image(out, boot_trytes, payload, nblocks=64)
+    print("wrote %s (boot %d trytes, payload %d trytes)"
+          % (out, len(boot_trytes), len(payload)))
     return 0
 
 
