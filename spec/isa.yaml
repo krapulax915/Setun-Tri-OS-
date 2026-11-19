@@ -1,0 +1,156 @@
+# TriISA v0.1 — single source of truth (frozen in M0).
+# Parsed by tools/isaspec.py (restricted YAML subset: nested maps, lists, scalars).
+# Assembler, emulator, disassembler and generated docs validate against this file.
+
+isa: TriISA
+version: "0.1"
+frozen: "2026-11-19"
+
+# ---- data types -------------------------------------------------------------
+types:
+  trit: [-1, 0, 1]            # written -, 0, +
+  tryte: {trits: 6, min: -364, max: 364}
+  word:  {trits: 18, trytes: 3, min: -193710244, max: 193710244}
+  dword: {trits: 36}
+  address: {trits: 18, unit: tryte, signed: true}
+  page_trytes: 729            # 3^6
+  word_align: 3               # word-aligned addresses satisfy addr % 3 == 0
+
+# ---- registers --------------------------------------------------------------
+registers:
+  count: 9
+  selector_encoding: "selector s in -4..+4 selects R(s+4)"
+  gprs:
+    R0: {role: zero,   note: "reads 0, writes ignored"}
+    R1: {role: arg0,   class: caller-saved}
+    R2: {role: arg1,   class: caller-saved}
+    R3: {role: arg2,   class: caller-saved}
+    R4: {role: arg3,   class: caller-saved}
+    R5: {role: temp,   class: callee-saved, note: "also capability transfer register in IPC"}
+    R6: {role: temp,   class: callee-saved}
+    R7: {role: link,   note: "LR: set by JAL, read by JR/RETI convention"}
+    R8: {role: sp,     note: "grows downward, tryte-granular, word-aligned by convention"}
+  special: [PC, PSW]
+
+# ---- instruction format -----------------------------------------------------
+format:
+  width_trits: 18
+  fields_msb_first: [op(4), rd(2), rs(2), imm(10)]
+  imm_range: [-29524, 29524]  # signed 10 trits
+  three_register_form: "rt occupies the lowest 2 trits of imm; remaining imm trits must be 0"
+  pc_advance_trytes: 3
+
+# ---- opcodes ----------------------------------------------------------------
+# op field: 4 trits = 81 values (-40..+40). Unassigned values raise ILLEGAL.
+formats:
+  SYS:  "no operands"
+  RRR:  "rd, rs, rt"
+  RRI:  "rd, rs, imm"
+  RI:   "rd, imm"
+  R:    "rs"
+  RS:   "rd, rs"              # rd + rs source pair (e.g. shifts reg form, CAS/XCHG)
+  OFF:  "pc-relative tryte offset"
+  RS_OFF: "rs, pc-relative tryte offset"
+  CSR_R: "rd, csr-number (in imm)"
+  CSR_W: "csr-number (in imm), rs"
+  TRAPF: "imm (syscall number goes in R1 at runtime)"
+
+opcodes:
+  # op 0 / positive 1..40
+  NOP:   {op: 0,   fmt: SYS}
+  ADD:   {op: 1,   fmt: RRR,  sem: "rd = rs + rt (wrap mod 3^18)"}
+  SUB:   {op: 2,   fmt: RRR,  sem: "rd = rs - rt (wrap)"}
+  MUL:   {op: 3,   fmt: RRR,  sem: "rd = rs * rt (wrap)"}
+  DIV:   {op: 4,   fmt: RRR,  sem: "rd = rs / rt round-nearest, ties toward zero; rt=0 traps DIV0"}
+  MOD:   {op: 5,   fmt: RRR,  sem: "rd = balanced remainder; rt=0 traps DIV0"}
+  NEG:   {op: 6,   fmt: RS,   sem: "rd = -rs (trit flip)"}
+  ADDI:  {op: 7,   fmt: RRI,  sem: "rd = rs + imm (wrap)"}
+  MULI:  {op: 8,   fmt: RRI,  sem: "rd = rs * imm (wrap)"}
+  MULH:  {op: 9,   fmt: RRR,  sem: "rd = high word of dword(18-trit) product rs*rt"}
+  TMIN:  {op: 10,  fmt: RRR,  sem: "tritwise min (ternary AND)"}
+  TMAX:  {op: 11,  fmt: RRR,  sem: "tritwise max (ternary OR)"}
+  TINV:  {op: 12,  fmt: RS,   sem: "tritwise negate each trit of rs into rd"}
+  TCONS: {op: 13,  fmt: RRR,  sem: "tritwise consensus: a if a==b else 0"}
+  TANY:  {op: 14,  fmt: RRR,  sem: "tritwise clip(a+b, -1, +1)"}
+  TSUM:  {op: 15,  fmt: RRR,  sem: "tritwise balanced mod-3 add, no carry"}
+  TMUL:  {op: 16,  fmt: RRR,  sem: "tritwise product"}
+  TSHL:  {op: 17,  fmt: RS,   sem: "rd = rs << k trits (k = imm or rt reg-form), zeros fill LSB, wrap"}
+  TSHR:  {op: 18,  fmt: RS,   sem: "rd = rs >> k trits: drop k lowest trits (= round-to-nearest /3^k), wrap"}
+  TROT:  {op: 19,  fmt: RS,   sem: "rd = rotate rs trits toward MSB by k mod 18 (reg form: k in rt)"}
+  CMP3:  {op: 20,  fmt: RRR,  sem: "rd = sign(rs - rt) in {-1,0,+1}"}
+  SIGN:  {op: 21,  fmt: RS,   sem: "rd = sign(rs)"}
+  CMPI3: {op: 22,  fmt: RRI,  sem: "rd = sign(rs - imm)"}
+  LDW:   {op: 23,  fmt: RS,   sem: "rd = word at [rs], word-aligned else ALIGN"}
+  STW:   {op: 24,  fmt: RS,   sem: "[rd] = rs (rd is the address), word-aligned else ALIGN"}
+  LDT:   {op: 25,  fmt: RS,   sem: "rd = tryte at [rs] (any address)"}
+  STT:   {op: 26,  fmt: RS,   sem: "[rd] = tryte rs (any address)"}
+  LDI:   {op: 27,  fmt: RI,   sem: "rd = imm (sign-extended 10-trit)"}
+  LUI:   {op: 28,  fmt: RI,   sem: "rd = imm << 10 trits"}
+  LEA:   {op: 29,  fmt: RRI,  sem: "rd = rs + imm (address arithmetic, no memory access)"}
+  JMP:   {op: 30,  fmt: OFF,  sem: "PC = PC_next + off"}
+  JAL:   {op: 31,  fmt: OFF,  sem: "R7 = PC_next; PC = PC_next + off"}
+  JR:    {op: 32,  fmt: R,    sem: "PC = rs (word-aligned recommended; unaligned = ALIGN)"}
+  BRN:   {op: 33,  fmt: RS_OFF, sem: "if rs < 0: PC = PC_next + off"}
+  BRZ:   {op: 34,  fmt: RS_OFF, sem: "if rs == 0: PC = PC_next + off"}
+  BRP:   {op: 35,  fmt: RS_OFF, sem: "if rs > 0: PC = PC_next + off"}
+  BRNZ:  {op: 36,  fmt: RS_OFF, sem: "if rs != 0: branch"}
+  BRNP:  {op: 37,  fmt: RS_OFF, sem: "if rs <= 0: branch"}
+  BRZP:  {op: 38,  fmt: RS_OFF, sem: "if rs >= 0: branch"}
+  BR3:   {op: 39,  fmt: RS_OFF, sem: "3-way: PC = word at [PC_next + off + 3*sign(rs)]; table word-aligned"}
+  HALT:  {op: 40,  fmt: SYS,  sem: "halt the machine (host: clean stop)"}
+  # negative ops (privileged system group; op<0 quick check)
+  TRAP:  {op: -1,  fmt: TRAPF, sem: "CAUSE=SYSCALL(0), TVAL=imm; kernel reads R1..R5"}
+  RETI:  {op: -2,  fmt: SYS,  sem: "PC = EPC; mode/irq reloaded from PSW (kernel-owned)"}
+  WFI:   {op: -3,  fmt: SYS,  sem: "wait for interrupt; idle thread sleeps here"}
+  CSRR:  {op: -4,  fmt: CSR_R, sem: "rd = CSR[csr]; mode + only"}
+  CSRW:  {op: -5,  fmt: CSR_W, sem: "CSR[csr] = rs; mode + only"}
+  FENCE: {op: -6,  fmt: SYS,  sem: "flush TLB; order memory ops"}
+  XCHG:  {op: -7,  fmt: RS,   sem: "atomically swap rd <-> word at [rs] (word-aligned)"}
+  CAS:   {op: -8,  fmt: RRR,  sem: "old=[rs]; if old==rd: [rs]=rt; rd=old (atomic)"}
+
+illegal_action: "ILLEGAL trap (cause -1), TVAL = opcode value"
+
+# ---- CSRs -------------------------------------------------------------------
+csrs:
+  PSW:       0
+  PTBR:      1
+  TVEC:      2
+  EPC:       3
+  CAUSE:     4
+  TVAL:      5
+  TIMER_CMP: 6
+  TIME:      7
+  CYCLE:     8
+  CAPBASE:   9
+psw_layout: "trit0 = mode(-/0/+), trit1 = irq-enable, trits2..17 reserved (read 0)"
+csr_access: "mode + only; user CSR access raises PRIVILEGE"
+
+# ---- traps ------------------------------------------------------------------
+causes:
+  SYSCALL: 0
+  ILLEGAL: -1
+  PRIVILEGE: -2
+  PAGEFAULT_R: -3
+  PAGEFAULT_W: -4
+  PAGEFAULT_X: -5
+  ALIGN: -6
+  DIV0: -7
+  BREAKPOINT: -8
+  TIMER: 1
+  IRQ_BASE: 10          # IRQ(device_id d) = 10 + d  (UART d=1, BLK d=2, RNG d=3, PROF d=4)
+
+trap_semantics: "EPC = PC (faults) or PC+3 (SYSCALL); CAUSE, TVAL set; mode->+, irq->-; PC = TVEC"
+
+# ---- arithmetic semantics ---------------------------------------------------
+arithmetic:
+  overflow: "wrap modulo 3^18 in balanced range [-(3^18-1)/2, +(3^18-1)/2]"
+  add_sub_mul: "never trap"
+  div: "round to nearest, ties toward zero; DIV by 0 traps DIV0"
+  mod: "r = a - q*d; |r| <= |d|/2 (equality only for even |d|); MOD by 0 traps DIV0"
+  mulh: "dword product = 36 trits; MULH keeps the high 18 trits (truncating wrap of the dword)"
+
+# ---- conventions ------------------------------------------------------------
+conventions:
+  calling: "R1..R4 args, R1 return value, R2 error code, R5/R6 callee-saved, R7 LR, R8 SP"
+  stack: "SP grows downward; push = SP -= 3 then STW"
+  text: "TriText: 1 tryte per char, escape tryte +364 + 3 trytes for full Unicode (docs/DECISIONS D-016)"
