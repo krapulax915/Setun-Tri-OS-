@@ -248,3 +248,18 @@ until a real in-TVM compiler exists.
 **Choice:** `Makefile` delegates every target to `python tools/mk.py <target>`; the canonical
 invocation used in CI/tests is `python tools/mk.py test|run|profile WORKLOAD=...`.
 **Reason:** host box (Windows/Git Bash) has no make; docs demand `make test` ergonomics.
+
+## D-026 — 2026-11-19 — Shift amount encoding disambiguation (M1)
+**Question:** docs/02 says shifts take "imm/rt", but the documented encoding (rt in the low 2
+imm trits, rest 0) collides with immediate k in [-4,+4].
+**Choice:** k is decoded as a register (R[k+4]) when the imm field value is in [-4,+4]; otherwise
+it is an immediate. The assembler therefore REJECTS immediate shifts with |k| <= 4 (use a register,
+or LDI+shift). Syntax: `TSHL rd, rs, rt` (full), `TSHL rd, k|rt` (in-place, source = rd).
+**Reason:** keeps one unambiguous encoding per word; |k|<=4 shifts cost one extra LDI — acceptable.
+
+## D-027 — 2026-11-19 — Privileged op set and WFI wake semantics (M1)
+**Choice:** privileged (mode `+` only, else PRIVILEGE trap): CSRR, CSRW, RETI, WFI, FENCE, HALT.
+XCHG/CAS are user-legal. WFI wakes on any pending IRQ even when irq-enable is `-` (masked):
+if enabled, the IRQ is delivered through the trap path; if masked, execution resumes at PC.
+**Reason:** matches common WFI hardware behaviour and gives M4's scheduler its sleep primitive;
+HALT is privileged so user code cannot power off the machine.
