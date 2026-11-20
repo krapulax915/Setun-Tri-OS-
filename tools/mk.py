@@ -176,6 +176,7 @@ def assemble(args):
 
 @target
 def run(args):
+    assemble([])        # no dep tracking in mk.py (D-025): rebuild every time
     ensure_build_dir()
     img = DEFAULT_IMAGE
     for arg in args:
@@ -194,6 +195,7 @@ def run(args):
 
 @target
 def image(args):
+    assemble([])        # no dep tracking in mk.py (D-025): rebuild every time
     ensure_build_dir()
     out = DEFAULT_IMAGE
     for arg in args:

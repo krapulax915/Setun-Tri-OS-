@@ -1,12 +1,12 @@
 # 07 Milestones, TODO, acceptance tests
 
-- [ ] **M0 Spec & trit library.** isa.yaml frozen, DECISIONS.md, `trit.py` (conversions int<->balanced ternary, add/sub/mul/div/mod,
+- [x] **M0 Spec & trit library.** isa.yaml frozen, DECISIONS.md, `trit.py` (conversions int<->balanced ternary, add/sub/mul/div/mod,
       tritwise ops, shifts). *Accept:* 10k random property tests vs Python ints; TriText round-trip incl. Hungarian chars.
-- [ ] **M1 Assembler + CPU core.** triasm, tvm core (no MMU). *Accept:* programs fib(20), sieve to 200, three-way-branch demo,
+- [x] **M1 Assembler + CPU core.** triasm, tvm core (no MMU). *Accept:* programs fib(20), sieve to 200, three-way-branch demo,
       division/modulo edge cases, every opcode has a test; disassembler round-trips the assembler output.
-- [ ] **M2 Devices, boot ROM, debugger.** UART, timer, block device, packing 5 trits/byte. *Accept:* "Hello, ternary world" via UART;
+- [x] **M2 Devices, boot ROM, debugger.** UART, timer, block device, packing 5 trits/byte. *Accept:* "Hello, ternary world" via UART;
       boot sector loads a TXE image from disk; tridbg can step/break.
-- [ ] **M3 MMU + traps + kernel boot.** Page tables, TLB, trap vector, kernel entry. *Accept:* page-fault tests (R/W/X/user/kernel),
+- [x] **M3 MMU + traps + kernel boot.** Page tables, TLB, trap vector, kernel entry. *Accept:* page-fault tests (R/W/X/user/kernel),
       kernel prints banner, handles ILLEGAL/DIV0 without dying, physical buddy allocator tests.
 - [ ] **M4 Threads + scheduler.** Context switch, timer preemption, three priority classes. *Accept:* 3 threads print interleaved;
       realtime starves background as designed; no lost wakeups under 1M-cycle stress.

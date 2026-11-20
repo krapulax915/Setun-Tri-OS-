@@ -2,6 +2,25 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M3 — 2026-11-20 — MMU, trap vector, buddy allocator, Triad kernel boot
+- `tools/tvm/mmu.py`: three-level ternary page tables (81 entries per frame,
+  balanced indexing, D-029), 27-entry TLB with accessed/dirty updates on hits,
+  kernel direct window (D-028), R/W/X/owner checks. `Machine` wires CPU↔MMU.
+- `tools/tvm/cpu.py`: integer-dispatch hot path (~24× faster execution);
+  an unhandled (bare) trap now halts the machine instead of looping.
+- `kernel/kernel.asm`: the Triad kernel — boot banner, trap vector arming,
+  trap handler (cause/tval/epc diagnostics, resume at EPC+3, D-031), ternary
+  buddy allocator (D-030..D-030e: 3-way BFS node tree, hint-based first-fit
+  scan, ancestor-allocated check, bottom-up merge on free), boot self-test
+  (240 alloc / free / realloc), ILLEGAL + DIV0 survival demo, clean power-off.
+- `lib/trilib.asm`: `const` macro parenthesization fix for compound expressions.
+- `tests/golden_buddy.py` + `tests/test_m3.py`: an independent Python model of
+  the allocator diffed against the TriASM implementation (600-step random
+  workload), 10 MMU tests (R/W/X/user/kernel, TLB eviction, accessed/dirty),
+  3 direct buddy tests, and the full-boot acceptance (banner, buddy ok,
+  illegal-resume ok, div0-resume ok, ready, exit 0, powered off).
+- Tests: 98 green. DECISIONS: D-028..D-032.
+
 ## M2 — 2026-11-19 — Devices, boot ROM, debugger
 - `tools/tvm/devices.py`: UART (TX/RX/STAT, TriText output stream with escape
   decoding), BlockDevice (file-backed, 729-tryte blocks, read/write commands +
