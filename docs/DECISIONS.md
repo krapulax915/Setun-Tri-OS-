@@ -263,3 +263,94 @@ XCHG/CAS are user-legal. WFI wakes on any pending IRQ even when irq-enable is `-
 if enabled, the IRQ is delivered through the trap path; if masked, execution resumes at PC.
 **Reason:** matches common WFI hardware behaviour and gives M4's scheduler its sleep primitive;
 HALT is privileged so user code cannot power off the machine.
+
+## D-028 — 2026-11-19 — MMU off mode = direct physical (M3)
+**Question:** docs/03's "identity-mapped window" — what exactly do addresses mean while
+PTBR == 0 (kernel threads, boot, M3)?
+**Choice:** PTBR == 0: every address is used as a physical address directly (boot and kernel
+live at positive physical addresses in the TVM). The kernel direct window (v < 0 → p = v + 3^17)
+is active only in mode `+` and exists for the MMU-on case, where the kernel reaches its own
+structures while servicing a process whose positive VAs go through the page tables.
+Negative VAs in mode −/0 always fault (kernel half is reserved).
+**Reason:** keeps boot/M3 simple and physical; the negative-half kernel split (docs/01) becomes
+meaningful with per-process spaces from M5 on.
+
+## D-029 — 2026-11-19 — Page table entry addressing (M3)
+**Choice:** a page table occupies one 729-tryte frame (81 words); the entry for balanced
+index i (−40..+40) sits at word offset (i + 40) inside the frame. Walk: L1 idx = VA trits
+[0..3], L2 [4..7], L3 [8..11], page offset [12..17]; tables are read through physical memory
+(so Accessed/Dirty updates never recurse).
+**Reason:** balanced indices map linearly onto array slots; hardware port keeps the same rule.
+
+## D-030 — 2026-11-19 — Ternary buddy allocator representation (M3)
+**Choice:** full binary tree of nodes re-expressed as a 3-way tree in BFS numbering: node 1 is
+the root, children of n are 3n−1, 3n, 3n+1; parent of n is (n+1−i)/3 with i = (n+1 mod 3,
+made non-negative). Depth d nodes are BFS ids [3^d, 2·3^d); node (d, j) covers frames
+[j·3^(MAX−d), (j+1)·3^(MAX−d)). State per node in a kernel tryte array: 0 free, 1 used,
+2 split. Free lists are singly linked through a kernel-side FREE_NEXT array (never through
+frame contents, per D-019). alloc finds the shallowest depth ≥ order with a free node and
+splits downward (pushing the two spare children to the deeper list); free merges when all
+three siblings are free, removing them from their list by scan.
+**Reason:** O(1) sibling checks, metadata entirely in kernel memory, and the 3-way split/merge
+is the ternary analogue of the binary buddy.
+
+## D-031 — 2026-11-19 — M3 trap resume semantics
+**Choice:** exceptions (negative CAUSE) resume at EPC+3 (faulting instruction skipped) in the
+M3 handler; SYSCALL (0) already stores EPC = pc+3 and resumes at EPC. The handler prints
+cause/tval diagnostics, saves/restores R1..R8 from a kernel frame, and never dies on
+ILLEGAL/DIV0/ALIGN/PAGEFAULT (M3 acceptance).
+**Reason:** minimal observable recovery for M3; real per-task semantics arrive with threads (M4).
+
+## D-030b — 2026-11-19 — Buddy depth↔order mapping (M3)
+**Choice:** an order-k block (3^k frames) lives at tree depth d = MAX_ORDER − k: order 0
+(1 frame) = depth-8 leaf, order 8 (whole tree) = root. buddy_alloc(order) computes
+target depth 8−order and scans free lists from that depth DOWNWARD (smallest adequate block
+first), splitting downward (depth increases toward leaves) until the target depth.
+buddy_free takes the node's depth explicitly.
+**Reason:** the first implementation scanned upward and split past the leaves (children ids
+out of range); depth grows toward smaller blocks, so splitting always increases depth.
+
+## D-030c — 2026-11-19 — Doubly-linked buddy free lists (M3)
+**Choice:** free lists are doubly linked (FREE_NEXT + FREE_PREV arrays in kernel memory).
+push_free sets prev[node] = −1 and prev[old-head] = node; pop_free unlinks the head in O(1);
+merging unlinks the three children O(1) via list_unlink (never a scan), marks them state 2
+and pushes the parent. Splitting re-marks the two spare children state 0 after pushing.
+**Reason:** scan-based removal made freeing O(n) each (O(n²) total); a lazy-tombstone variant
+created free-list cycles when a node was pushed twice while still linked. Doubly-linked lists
+give O(1) push/pop/unlink with no stale entries, at the cost of one extra kernel array.
+(Superseded by D-030d: the list bookkeeping was a persistent bug surface in TriASM.)
+
+## D-030d — 2026-11-20 — Hint-based scan allocator (supersedes D-030c)
+**Choice:** the shipped M3 allocator drops free lists entirely. State array only (0 free /
+1 used / 2 split, D-030) plus one word HINT[0..8]. buddy_alloc(order): target depth
+t = 8−order (D-030b), scan nodes of depth t ascending from HINT[t]; the first state-0 node
+that passes the D-030e ancestor check is taken: state[n] = 1, every ancestor set to 2,
+HINT[t] = j+1. buddy_free(depth, n): state[n] = 0, lower HINT[depth] to j when the freed
+block sits below the hint, then recompute ancestors bottom-up (parent = 0 iff all three
+children are 0, else 2) until the root.
+**Reason:** the free-list variant needed push/pop/unlink plus split logic across four more
+kernel arrays, and every piece was another TriASM register/stack bug surface (stale R2, LR
+clobbers, list cycles). The hint scan has no linked structure to corrupt, is ~120
+instructions total, and is validated exactly against an independently written Python model
+(tests/golden_buddy.py, 600-step random workload diff) plus a 240-iteration boot self-test.
+Scan cost stays small: hints advance monotonically per depth and are lowered only by frees.
+
+## D-030e — 2026-11-20 — Ancestor-allocated check in buddy_alloc
+**Choice:** a state-0 node is allocatable only if no ancestor has state 1. The allocator
+walks up from each candidate (walker kept in a machine-stack slot; parent of n is
+(n+1−i)/3 with i = non-negative (n+1) mod 3) and, on hitting a state-1 ancestor, advances
+HINT[t] past the candidate and rescans.
+**Reason:** direct allocation of larger blocks (no split path, D-030d) leaves the leaves
+BELOW an allocated block at state 0 — first-fit would hand out memory inside a live
+allocation. The walk-up is at most 8 bstate_get calls and makes the scan exactly equivalent
+to the golden model.
+
+## D-032 — 2026-11-20 — BSS is not stored in the TXE
+**Choice:** kernel data regions (KDATA: buddy state, HINT, ksave, pnumbuf, nodes array) are
+never emitted into the TXE — the .org gap between segments is simply absent, and the loader
+does a sparse segment copy with no zero-fill. Every KDATA byte is initialised before first
+read: buddy_init writes all states and hints, the self-test writes nodes[] before reading,
+putnum writes pnumbuf before reading.
+**Reason:** keeps the kernel image small (no 1M-tryte hole in the TXE), matches the M2
+loader semantics, and the "written before read" invariant is policed by the boot self-test
+itself — any uninitialised read shows up as a wrong alloc/free against the golden model.

@@ -221,10 +221,12 @@ class TestDevices(unittest.TestCase):
 
 class TestBoot(unittest.TestCase):
     def test_hello_ternary_world_full_boot(self):
-        """ROM -> boot sector -> kernel TXE from disk -> UART greeting."""
+        """ROM -> boot sector -> kernel TXE from disk -> UART greeting.
+        Since M3 the kernel prints the full boot banner; the greeting must be
+        part of it."""
         m = boot_machine()
-        code = m.run(max_steps=200000)
-        self.assertEqual(m.output_text(), "Hello, ternary world!\n")
+        code = m.run(max_steps=40_000_000)
+        self.assertIn("Hello, ternary world!", m.output_text())
         self.assertEqual(code, 0)
         self.assertTrue(m.powered_off)
 
@@ -256,17 +258,17 @@ class TestDebugger(unittest.TestCase):
         from tridbg import Debugger
         m = boot_machine()
         kernel = triasm.assemble_file(os.path.join(REPO, "kernel", "kernel.asm"))
-        brk_addr = kernel.symbols["print"]        # break at the greeting loop
+        brk_addr = kernel.symbols["puts"]         # break when the kernel prints
         d = Debugger(m, out=Path(os.devnull).open("w"))
         d.cmd("brk %d" % brk_addr)
         d.cmd("run")
         self.assertEqual(d.last_stop, "break")
         self.assertEqual(m.cpu.pc, brk_addr)
         d.cmd("step 3")
-        self.assertEqual(m.cpu.pc, brk_addr + 9)  # LDT/BRZ/STT... 3 instrs
+        self.assertEqual(m.cpu.pc, brk_addr + 9)  # 3 instructions deeper
         d.cmd("nobrk")
         d.cmd("run")
-        self.assertEqual(m.output_text(), "Hello, ternary world!\n")
+        self.assertIn("Setun Tri OS v0.1 ready", m.output_text())
         d.cmd("regs")                             # must not raise
         d.cmd("dis 7290 4")
 

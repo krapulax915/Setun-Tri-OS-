@@ -14,6 +14,7 @@ import trit as T
 import pack as packmod
 from tvm.memory import PhysicalMemory, BusError
 from tvm.cpu import CPU, CSR_NUM, CAUSE
+from tvm.mmu import MMU
 from tvm.devices import (Device, Uart, BlockDevice, Rng, PowerDevice, ProfDevice,
                          MMIO_BASE, MMIO_SPAN,
                          UART_TX, UART_RX, UART_STAT, BLK_LBA, BLK_BUF, BLK_CMD,
@@ -111,7 +112,9 @@ class Machine:
         self.devices = [self._dev_uart, self._dev_blk, self._dev_rng,
                         self._dev_power, self._dev_prof]
         self.bus = MmioBus(self.ram, self.devices)
-        self.cpu = CPU(self.bus, trap_hook=self._bare_trap)
+        self.mmu = MMU(self.bus)
+        self.cpu = CPU(self.mmu, trap_hook=self._bare_trap)
+        self.mmu.cpu = self.cpu
         self._dev_uart.on_output = self._uart_out
         self.profiler = profiler
 
@@ -208,7 +211,9 @@ class Machine:
 
     def _reset(self):
         self.reset_requested = False
-        self.cpu = CPU(self.bus, trap_hook=self._bare_trap)
+        self.mmu = MMU(self.bus)
+        self.cpu = CPU(self.mmu, trap_hook=self._bare_trap)
+        self.mmu.cpu = self.cpu
         if self._rom_bytes is not None:
             self.bus.write_trytes(0, packmod.unpack_trytes(self._rom_bytes))
         return self.run()

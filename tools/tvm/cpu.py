@@ -2,8 +2,10 @@
 
 Implements spec/isa.yaml exactly: 18-trit words, 9 GPRs (R0 hardwired zero),
 no flag register, 3-way compare, balanced arithmetic with wrap (D-005/D-008),
-tritwise logic (D-009), privileged system ops (D-027 notes), trap entry per
-D-013/D-017.
+tritwise logic (D-009), privileged system ops (D-027), trap entry per D-013/D-017.
+
+The hot path dispatches on the integer op value (spec/isa.yaml remains the
+source of truth: the dispatch table is built from it at import time).
 """
 from __future__ import annotations
 
@@ -41,6 +43,85 @@ PRIVILEGED_OPS = {"CSRR", "CSRW", "RETI", "WFI", "FENCE", "HALT"}
 SHIFT_OPS = {"TSHL", "TSHR", "TROT"}
 
 IMM_MIN, IMM_MAX = -29524, 29524
+WORD_MAX = T.WORD_MAX
+WORD_MIN = T.WORD_MIN
+
+# integer op values (dispatch keys), built from the frozen ISA
+_OPV = {name: spec["op"] for name, spec in ISA["opcodes"].items()}
+OP_TABLE = {spec["op"]: name for name, spec in ISA["opcodes"].items()}
+OP_MNEMONIC = dict(_OPV)
+
+OP_LDW = _OPV["LDW"]
+OP_STW = _OPV["STW"]
+OP_LDT = _OPV["LDT"]
+OP_STT = _OPV["STT"]
+OP_ADD = _OPV["ADD"]
+OP_SUB = _OPV["SUB"]
+OP_MUL = _OPV["MUL"]
+OP_DIV = _OPV["DIV"]
+OP_MOD = _OPV["MOD"]
+OP_ADDI = _OPV["ADDI"]
+OP_MULI = _OPV["MULI"]
+OP_MULH = _OPV["MULH"]
+OP_CMP3 = _OPV["CMP3"]
+OP_CMPI3 = _OPV["CMPI3"]
+OP_SIGN = _OPV["SIGN"]
+OP_LEA = _OPV["LEA"]
+OP_LDI = _OPV["LDI"]
+OP_LUI = _OPV["LUI"]
+OP_JMP = _OPV["JMP"]
+OP_JAL = _OPV["JAL"]
+OP_JR = _OPV["JR"]
+OP_BRN = _OPV["BRN"]
+OP_BRZ = _OPV["BRZ"]
+OP_BRP = _OPV["BRP"]
+OP_BRNZ = _OPV["BRNZ"]
+OP_BRNP = _OPV["BRNP"]
+OP_BRZP = _OPV["BRZP"]
+OP_BR3 = _OPV["BR3"]
+OP_NOP = _OPV["NOP"]
+OP_NEG = _OPV["NEG"]
+OP_TMIN = _OPV["TMIN"]
+OP_TMAX = _OPV["TMAX"]
+OP_TINV = _OPV["TINV"]
+OP_TCONS = _OPV["TCONS"]
+OP_TANY = _OPV["TANY"]
+OP_TSUM = _OPV["TSUM"]
+OP_TMUL = _OPV["TMUL"]
+OP_TSHL = _OPV["TSHL"]
+OP_TSHR = _OPV["TSHR"]
+OP_TROT = _OPV["TROT"]
+OP_HALT = _OPV["HALT"]
+OP_XCHG = _OPV["XCHG"]
+OP_CAS = _OPV["CAS"]
+
+# hot-path decode cache (loops execute the same words many times)
+_DECODE_CACHE = {}
+_DECODE_CACHE_CAP = 1 << 20
+
+
+def decode(word: int):
+    """18-trit word -> (op, rd_sel, rs_sel, imm); integer field extraction,
+    memoised."""
+    d = _DECODE_CACHE.get(word)
+    if d is not None:
+        return d
+    imm = T.wrap(word, 10)
+    x = (word - imm) // 3 ** 10
+    rs = T.wrap(x, 2)
+    y = (x - rs) // 9
+    rd = T.wrap(y, 2)
+    op = (y - rd) // 9
+    d = (op, rd, rs, imm)
+    if len(_DECODE_CACHE) < _DECODE_CACHE_CAP:
+        _DECODE_CACHE[word] = d
+    return d
+
+
+def encode(op: int, rd_sel: int, rs_sel: int, imm: int) -> int:
+    assert -40 <= op <= 40 and -4 <= rd_sel <= 4 and -4 <= rs_sel <= 4 \
+        and IMM_MIN <= imm <= IMM_MAX
+    return ((op * 9 + rd_sel) * 9 + rs_sel) * 3 ** 10 + imm
 
 
 class Trap(Exception):
@@ -50,29 +131,6 @@ class Trap(Exception):
         self.cause = cause
         self.tval = tval
         self.epc = epc
-
-
-def decode(word: int):
-    """18-trit word -> (op, rd_sel, rs_sel, imm); integer field extraction."""
-    imm = T.wrap(word, 10)
-    x = (word - imm) // 3 ** 10
-    rs = T.wrap(x, 2)
-    y = (x - rs) // 9
-    rd = T.wrap(y, 2)
-    op = (y - rd) // 9
-    return op, rd, rs, imm
-
-
-def encode(op: int, rd_sel: int, rs_sel: int, imm: int) -> int:
-    assert -40 <= op <= 40 and -4 <= rd_sel <= 4 and -4 <= rs_sel <= 4 \
-        and IMM_MIN <= imm <= IMM_MAX
-    return ((op * 9 + rd_sel) * 9 + rs_sel) * 3 ** 10 + imm
-
-
-OP_TABLE = {}          # op value -> mnemonic (filled from isa.yaml)
-for _name, _spec in ISA["opcodes"].items():
-    OP_TABLE[_spec["op"]] = _name
-OP_MNEMONIC = {name: spec["op"] for name, spec in ISA["opcodes"].items()}
 
 
 class CPU:
@@ -100,7 +158,7 @@ class CPU:
             CSR_PTBR: 0,
             CSR_CAPBASE: 0,
         }
-        self.last_mnemonic = None             # for traces/debug
+        self.last_mnemonic = None             # debugger convenience
 
     # ---- register helpers -------------------------------------------------------
     def _rd(self, sel):
@@ -109,7 +167,7 @@ class CPU:
     def _wr(self, sel, v):
         idx = sel + 4
         if idx != 0:
-            self.r[idx] = T.wrap(v, T.WORD_TRITS)
+            self.r[idx] = T.wrap(v, 18)
 
     # ---- CSR view -----------------------------------------------------------------
     def csr_read(self, num):
@@ -117,9 +175,9 @@ class CPU:
             irq = self.irq_enable if self.irq_enable in (-1, 0, 1) else -1
             return self.mode + 3 * irq
         if num == CSR_TIME:
-            return T.wrap(self.time, T.WORD_TRITS)
+            return T.wrap(self.time, 18)
         if num == CSR_CYCLE:
-            return T.wrap(self.cycle, T.WORD_TRITS)
+            return T.wrap(self.cycle, 18)
         if num == CSR_TIMER_CMP:
             return 0 if self.timer_cmp is None else self.timer_cmp
         if num in self.csr:
@@ -134,7 +192,7 @@ class CPU:
             self.irq_enable = irq
             return True
         if num == CSR_TIMER_CMP:
-            self.timer_cmp = v                  # 0 = fire immediately (level semantics)
+            self.timer_cmp = v                  # 0 = fire immediately (level)
             return True
         if num in self.csr:
             self.csr[num] = v
@@ -145,10 +203,11 @@ class CPU:
     def _trap(self, cause, tval, epc):
         if self.csr.get(CSR_TVEC, 0) == 0 and self.trap_hook is not None:
             self.trap_hook(cause, tval, epc)
+            self.halted = True              # bare metal: unhandled trap halts
             return
         self.csr[CSR_EPC] = epc
         self.csr[CSR_CAUSE] = cause
-        self.csr[CSR_TVAL] = T.wrap(tval, T.WORD_TRITS)
+        self.csr[CSR_TVAL] = T.wrap(tval, 18)
         self.mode = 1
         self.irq_enable = -1
         self.pc = self.csr[CSR_TVEC]
@@ -200,185 +259,322 @@ class CPU:
             epc = pc if tr.epc is None else tr.epc
             self._trap(tr.cause, tr.tval, epc)
         except Exception as e:
-            addr = getattr(e, "addr", None)
-            if addr is not None:                # BusError from memory
-                kind = getattr(e, "kind", "r")
-                cause = {"r": C_PFR, "w": C_PFW, "x": C_PFX}.get(kind, C_PFR)
-                self._trap(cause, addr, pc)
+            cause = getattr(e, "cause", None)
+            if cause is not None:               # TVMFault from the MMU
+                self._trap(cause, getattr(e, "tval", 0), pc)
             else:
-                raise
+                addr = getattr(e, "addr", None)
+                if addr is not None:            # BusError from memory
+                    kind = getattr(e, "kind", "r")
+                    cause2 = {"r": C_PFR, "w": C_PFW, "x": C_PFX}.get(kind, C_PFR)
+                    self._trap(cause2, addr, pc)
+                else:
+                    raise
         self.cycle += 1
         self.time += 1
         return True
 
-    # ---- instruction execution ---------------------------------------------------------
+    # ---- instruction execution (integer dispatch; hot ops first) ----------------------
     def _execute(self, word, pc):
         op, rd_s, rs_s, imm = decode(word)
-        mn = OP_TABLE.get(op)
-        if mn is None:
-            raise Trap(C_ILLEGAL, op)
-        self.last_mnemonic = mn
         r = self.r
+        idx = rd_s + 4                 # destination index (0 = R0: writes ignored)
+        rs4 = rs_s + 4
+        mem = self.mem
+        W = WORD_MAX
 
-        def val(sel):
-            return r[sel + 4]
-
-        def wr(sel, v):
-            self._wr(sel, v)
-
-        def jump(target):
-            if target % 3 != 0:
-                raise Trap(C_ALIGN, target)
-            self.pc = T.wrap(target, T.WORD_TRITS)
-
-        def mem_addr(a, kind):
-            if a % 3 != 0:
+        if op == OP_LDW:                               # LDW rd, (rs)
+            a = r[rs4]
+            if a % 3:
                 raise Trap(C_ALIGN, a)
-            return a
-
-        nxt = pc + 3
-        set_pc = False
-
-        if mn == "NOP":
+            v = mem.read_word(a)
+            if idx:
+                r[idx] = v
+        elif op == OP_ADDI:                            # ADDI rd, rs, imm
+            v = r[rs4] + imm
+            if v > W or v < -W:
+                v = T.wrap(v, 18)
+            if idx:
+                r[idx] = v
+        elif op == OP_LDT:                             # LDT rd, (rs)
+            if idx:
+                r[idx] = mem.read_tryte(r[rs4])
+        elif op == OP_STT:                             # STT (rd), rs
+            mem.write_tryte(r[idx], T.wrap(r[rs4], 6))
+        elif op == OP_STW:                             # STW (rd), rs
+            a = r[idx]
+            if a % 3:
+                raise Trap(C_ALIGN, a)
+            mem.write_word(a, r[rs4])
+        elif op == OP_ADD:                             # ADD rd, rs, rt
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            v = r[rs4] + r[rt4]
+            if v > W or v < -W:
+                v = T.wrap(v, 18)
+            if idx:
+                r[idx] = v
+        elif op == OP_SUB:                             # SUB
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            v = r[rs4] - r[rt4]
+            if v > W or v < -W:
+                v = T.wrap(v, 18)
+            if idx:
+                r[idx] = v
+        elif op == OP_LEA:                             # LEA rd, rs, imm
+            v = r[rs4] + imm
+            if v > W or v < -W:
+                v = T.wrap(v, 18)
+            if idx:
+                r[idx] = v
+        elif op == OP_CMP3:                            # CMP3 rd, rs, rt
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            a = r[rs4]
+            b = r[rt4]
+            if idx:
+                r[idx] = (a > b) - (a < b)
+        elif op == OP_LDI:                             # LDI rd, imm
+            if idx:
+                r[idx] = imm
+        elif op == OP_BRZ:                             # BRZ
+            if r[rs4] == 0:
+                t = pc + 3 + imm
+                if t % 3:
+                    raise Trap(C_ALIGN, t)
+                self.pc = T.wrap(t, 18)
+                return
+        elif op == OP_BRNZ:                            # BRNZ
+            if r[rs4] != 0:
+                t = pc + 3 + imm
+                if t % 3:
+                    raise Trap(C_ALIGN, t)
+                self.pc = T.wrap(t, 18)
+                return
+        elif op == OP_BRP:                             # BRP
+            if r[rs4] > 0:
+                t = pc + 3 + imm
+                if t % 3:
+                    raise Trap(C_ALIGN, t)
+                self.pc = T.wrap(t, 18)
+                return
+        elif op == OP_BRN:                             # BRN
+            if r[rs4] < 0:
+                t = pc + 3 + imm
+                if t % 3:
+                    raise Trap(C_ALIGN, t)
+                self.pc = T.wrap(t, 18)
+                return
+        elif op == OP_BRNP:                            # BRNP
+            if r[rs4] <= 0:
+                t = pc + 3 + imm
+                if t % 3:
+                    raise Trap(C_ALIGN, t)
+                self.pc = T.wrap(t, 18)
+                return
+        elif op == OP_BRZP:                            # BRZP
+            if r[rs4] >= 0:
+                t = pc + 3 + imm
+                if t % 3:
+                    raise Trap(C_ALIGN, t)
+                self.pc = T.wrap(t, 18)
+                return
+        elif op == OP_JMP:                             # JMP
+            t = pc + 3 + imm
+            if t % 3:
+                raise Trap(C_ALIGN, t)
+            self.pc = T.wrap(t, 18)
+            return
+        elif op == OP_JAL:                             # JAL
+            r[7] = T.wrap(pc + 3, 18)
+            t = pc + 3 + imm
+            if t % 3:
+                raise Trap(C_ALIGN, t)
+            self.pc = T.wrap(t, 18)
+            return
+        elif op == OP_JR:                              # JR rs
+            t = r[rs4]
+            if t % 3:
+                raise Trap(C_ALIGN, t)
+            self.pc = T.wrap(t, 18)
+            return
+        elif op == OP_CMPI3:                           # CMPI3
+            a = r[rs4]
+            if idx:
+                r[idx] = (a > imm) - (a < imm)
+        elif op == OP_LUI:                             # LUI
+            v = imm * 59049
+            if v > W or v < -W:
+                v = T.wrap(v, 18)
+            if idx:
+                r[idx] = v
+        elif op == OP_MUL:                             # MUL
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            v = r[rs4] * r[rt4]
+            if v > W or v < -W:
+                v = T.wrap(v, 18)
+            if idx:
+                r[idx] = v
+        elif op == OP_DIV:                             # DIV
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            d = r[rt4]
+            if d == 0:
+                raise Trap(C_DIV0, 0)
+            if idx:
+                r[idx] = T.bdiv(r[rs4], d)
+        elif op == OP_MOD:                             # MOD
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            d = r[rt4]
+            if d == 0:
+                raise Trap(C_DIV0, 0)
+            if idx:
+                r[idx] = T.bmod(r[rs4], d)
+        elif op == OP_BR3:                             # BR3 rs, table
+            table = pc + 3 + imm
+            if table % 3:
+                raise Trap(C_ALIGN, table)
+            v = r[rs4]
+            ti = (v > 0) - (v < 0) + 1
+            t = mem.read_word(table + 3 * ti)
+            if t % 3:
+                raise Trap(C_ALIGN, t)
+            self.pc = T.wrap(t, 18)
+            return
+        elif op == OP_SIGN:                            # SIGN
+            a = r[rs4]
+            if idx:
+                r[idx] = (a > 0) - (a < 0)
+        elif op == OP_NOP:                             # NOP
             pass
-        elif mn == "HALT":
-            self._need_kernel(op)
-            self.halted = True
-        elif mn == "ADD":
-            wr(rd_s, val(rs_s) + r[self._rt(imm) + 4])
-        elif mn == "SUB":
-            wr(rd_s, val(rs_s) - r[self._rt(imm) + 4])
-        elif mn == "MUL":
-            wr(rd_s, val(rs_s) * r[self._rt(imm) + 4])
-        elif mn == "DIV":
-            d = r[self._rt(imm) + 4]
-            if d == 0:
-                raise Trap(C_DIV0, 0)
-            wr(rd_s, T.bdiv(val(rs_s), d))
-        elif mn == "MOD":
-            d = r[self._rt(imm) + 4]
-            if d == 0:
-                raise Trap(C_DIV0, 0)
-            wr(rd_s, T.bmod(val(rs_s), d))
-        elif mn == "NEG":
-            wr(rd_s, -val(rs_s))
-        elif mn == "ADDI":
-            wr(rd_s, val(rs_s) + imm)
-        elif mn == "MULI":
-            wr(rd_s, val(rs_s) * imm)
-        elif mn == "MULH":
-            wr(rd_s, T.bmulh(val(rs_s), r[self._rt(imm) + 4]))
-        elif mn == "TMIN":
-            wr(rd_s, T.tmin(val(rs_s), r[self._rt(imm) + 4]))
-        elif mn == "TMAX":
-            wr(rd_s, T.tmax(val(rs_s), r[self._rt(imm) + 4]))
-        elif mn == "TINV":
-            wr(rd_s, T.tinv(val(rs_s)))
-        elif mn == "TCONS":
-            wr(rd_s, T.tcons(val(rs_s), r[self._rt(imm) + 4]))
-        elif mn == "TANY":
-            wr(rd_s, T.tany(val(rs_s), r[self._rt(imm) + 4]))
-        elif mn == "TSUM":
-            wr(rd_s, T.tsum(val(rs_s), r[self._rt(imm) + 4]))
-        elif mn == "TMUL":
-            wr(rd_s, T.tmul(val(rs_s), r[self._rt(imm) + 4]))
-        elif mn in SHIFT_OPS:
+        elif op == OP_NEG:                             # NEG
+            if idx:
+                r[idx] = T.wrap(-r[rs4], 18)
+        elif op == OP_MULI:                            # MULI
+            v = r[rs4] * imm
+            if v > W or v < -W:
+                v = T.wrap(v, 18)
+            if idx:
+                r[idx] = v
+        elif op == OP_MULH:                            # MULH
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            if idx:
+                r[idx] = T.bmulh(r[rs4], r[rt4])
+        elif op == OP_TMIN:                            # TMIN
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            if idx:
+                r[idx] = T.tmin(r[rs4], r[rt4])
+        elif op == OP_TMAX:                            # TMAX
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            if idx:
+                r[idx] = T.tmax(r[rs4], r[rt4])
+        elif op == OP_TINV:                            # TINV
+            if idx:
+                r[idx] = T.tinv(r[rs4])
+        elif op == OP_TCONS:                           # TCONS
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            if idx:
+                r[idx] = T.tcons(r[rs4], r[rt4])
+        elif op == OP_TANY:                            # TANY
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            if idx:
+                r[idx] = T.tany(r[rs4], r[rt4])
+        elif op == OP_TSUM:                            # TSUM
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            if idx:
+                r[idx] = T.tsum(r[rs4], r[rt4])
+        elif op == OP_TMUL:                            # TMUL
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            if idx:
+                r[idx] = T.tmul(r[rs4], r[rt4])
+        elif op == OP_TSHL or op == OP_TSHR or op == OP_TROT:
             k = imm if not (-4 <= imm <= 4) else r[imm + 4]     # D-026
-            if mn == "TSHL":
-                wr(rd_s, T.bshl(val(rs_s), k))
-            elif mn == "TSHR":
-                wr(rd_s, T.bshr(val(rs_s), k))
-            else:
-                wr(rd_s, T.brot(val(rs_s), k))
-        elif mn == "CMP3":
-            a, b = val(rs_s), r[self._rt(imm) + 4]
-            wr(rd_s, (a > b) - (a < b))
-        elif mn == "SIGN":
-            a = val(rs_s)
-            wr(rd_s, (a > 0) - (a < 0))
-        elif mn == "CMPI3":
-            a = val(rs_s)
-            wr(rd_s, (a > imm) - (a < imm))
-        elif mn == "LDW":
-            a = mem_addr(val(rs_s), "r")
-            wr(rd_s, self.mem.read_word(a))
-        elif mn == "STW":
-            a = mem_addr(val(rd_s), "w")
-            self.mem.write_word(a, val(rs_s))
-        elif mn == "LDT":
-            wr(rd_s, self.mem.read_tryte(val(rs_s)))
-        elif mn == "STT":
-            self.mem.write_tryte(val(rd_s), T.wrap(val(rs_s), T.TRYTE_TRITS))
-        elif mn == "LDI":
-            wr(rd_s, imm)
-        elif mn == "LUI":
-            wr(rd_s, imm * 3 ** 10)
-        elif mn == "LEA":
-            wr(rd_s, val(rs_s) + imm)
-        elif mn == "JMP":
-            jump(pc + 3 + imm)
-            set_pc = True
-        elif mn == "JAL":
-            self.r[7] = T.wrap(pc + 3, T.WORD_TRITS)   # R7 = LR
-            jump(pc + 3 + imm)
-            set_pc = True
-        elif mn == "JR":
-            jump(val(rs_s))
-            set_pc = True
-        elif mn in ("BRN", "BRZ", "BRP", "BRNZ", "BRNP", "BRZP"):
-            v = val(rs_s)
-            take = {
-                "BRN": v < 0, "BRZ": v == 0, "BRP": v > 0,
-                "BRNZ": v != 0, "BRNP": v <= 0, "BRZP": v >= 0,
-            }[mn]
-            if take:
-                jump(pc + 3 + imm)
-                set_pc = True
-        elif mn == "BR3":
-            table = mem_addr(pc + 3 + imm, "r")
-            v = val(rs_s)
-            idx = (v > 0) - (v < 0) + 1                # -1/0/+1 -> 0/1/2
-            target = self.mem.read_word(table + 3 * idx)
-            jump(target)
-            set_pc = True
-        elif mn == "TRAP":
-            raise Trap(C_SYSCALL, imm, epc=pc + 3)     # D-017: EPC = PC+3
-        elif mn == "RETI":
-            self._need_kernel(op)
-            self.pc = self.csr[CSR_EPC]                # mode/irq come from PSW (kernel CSRW'd it)
-            set_pc = True
-        elif mn == "WFI":
-            self._need_kernel(op)
+            if idx:
+                if op == OP_TSHL:
+                    r[idx] = T.bshl(r[rs4], k)
+                elif op == OP_TSHR:
+                    r[idx] = T.bshr(r[rs4], k)
+                else:
+                    r[idx] = T.brot(r[rs4], k)
+        elif op == OP_HALT:                            # HALT (privileged)
+            if self.mode != 1:
+                raise Trap(C_PRIV, op)
+            self.halted = True
+        elif op == _OPV["TRAP"]:                       # TRAP imm (D-017)
+            raise Trap(C_SYSCALL, imm, epc=pc + 3)
+        elif op == _OPV["RETI"]:                       # RETI (privileged)
+            if self.mode != 1:
+                raise Trap(C_PRIV, op)
+            self.pc = self.csr[CSR_EPC]
+            return
+        elif op == _OPV["WFI"]:                        # WFI (privileged)
+            if self.mode != 1:
+                raise Trap(C_PRIV, op)
             self.waiting = True
-        elif mn == "CSRR":
-            self._need_kernel(op)
+        elif op == _OPV["CSRR"]:                       # CSRR (privileged)
+            if self.mode != 1:
+                raise Trap(C_PRIV, op)
             v = self.csr_read(imm)
             if v is None:
                 raise Trap(C_ILLEGAL, imm)
-            wr(rd_s, v)
-        elif mn == "CSRW":
-            self._need_kernel(op)
-            if not self.csr_write(imm, val(rs_s)):
+            if idx:
+                r[idx] = v
+        elif op == _OPV["CSRW"]:                       # CSRW (privileged)
+            if self.mode != 1:
+                raise Trap(C_PRIV, op)
+            if not self.csr_write(imm, r[rs4]):
                 raise Trap(C_ILLEGAL, imm)
-        elif mn == "FENCE":
-            self._need_kernel(op)
-            self.tlb_flush()                            # no-op until M3
-        elif mn == "XCHG":
-            a = mem_addr(val(rs_s), "rw")
-            old = self.mem.read_word(a)
-            self.mem.write_word(a, val(rd_s))
-            wr(rd_s, old)
-        elif mn == "CAS":
-            a = mem_addr(val(rs_s), "rw")
-            old = self.mem.read_word(a)
-            if old == val(rd_s):
-                self.mem.write_word(a, r[self._rt(imm) + 4])
-            wr(rd_s, old)
+        elif op == _OPV["FENCE"]:                      # FENCE (privileged)
+            if self.mode != 1:
+                raise Trap(C_PRIV, op)
+            self.tlb_flush()
+        elif op == OP_XCHG:                            # XCHG rd, (rs)
+            a = r[rs4]
+            if a % 3:
+                raise Trap(C_ALIGN, a)
+            old = mem.read_word(a)
+            mem.write_word(a, r[idx])
+            if idx:
+                r[idx] = old
+        elif op == OP_CAS:                             # CAS rd, (rs), rt
+            rt4 = imm + 4
+            if rt4 < 0 or rt4 > 8:
+                raise Trap(C_ILLEGAL, imm)
+            a = r[rs4]
+            if a % 3:
+                raise Trap(C_ALIGN, a)
+            old = mem.read_word(a)
+            if old == r[idx]:
+                mem.write_word(a, r[rt4])
+            if idx:
+                r[idx] = old
         else:
             raise Trap(C_ILLEGAL, op)
 
-        if not set_pc:
-            self.pc = nxt
+        self.pc = pc + 3
 
     def _rt(self, imm):
         """rt register selector from the low 2 trits of imm (RRR form)."""

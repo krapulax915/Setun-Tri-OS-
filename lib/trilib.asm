@@ -5,8 +5,8 @@
 ;   remainder r = v - h*59049 is always within 10-trit range (|r| <= 29524).
 
 .macro const r, v
-    LUI  %r, %v / 59049
-    ADDI %r, %r, %v - %v / 59049 * 59049
+    LUI  %r, (%v) / 59049
+    ADDI %r, %r, (%v) - ((%v) / 59049) * 59049
 .endmacro
 
 ; ---- stack helpers ------------------------------------------------------------
