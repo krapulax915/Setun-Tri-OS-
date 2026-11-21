@@ -488,14 +488,14 @@ ed_out:
     ret
 
 wait_push:                           ; R1 = &head, R2 = &tail, R3 = tid
-    push R1                          ; the pushed thread's own next link must be
-    push R2                          ; cleared too, or its stale free-list/queue
-    push R4                          ; link poisons the queue on the dequeue
-    push R7
-    ADD R1, R3, R0
+    push R7                          ; the pushed thread's own next link must be
+    push R4                          ; cleared too, or its stale free-list/queue
+    push R2                          ; link poisons the queue on the dequeue.
+    push R1                          ; Push order puts R1 on top so the early
+    ADD R1, R3, R0                   ; pop below restores it, not the LR.
     call tcb_addr                    ; R1 = &TCB[tid]
     STW R1, R0                       ; TCB[tid].next = 0
-    pop R1
+    pop R1                           ; R1 = &head back
     LDW R5, R2                       ; tail
     CMPI3 R4, R5, 0
     BRZ R4, wp_empty
@@ -508,10 +508,9 @@ wp_empty:
 wp_link:
     ADD R1, R2, R0
     STW R1, R3                       ; tail = tid
-    pop R7
-    pop R4
     pop R2
-    pop R1
+    pop R4
+    pop R7
     ret
 
 ipc_deliver:                         ; R1 = &target TCB: copy the current frame's
