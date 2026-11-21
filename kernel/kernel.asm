@@ -32,20 +32,20 @@
     .equ KSAVE,      KDATA+9842+27      ; 11 words
     .equ PNUMBUF,    KSAVE+33           ; 12 trytes
     .equ NODES,      PNUMBUF+12         ; 6132 words (self-test array)
-    .equ RES_END,    1413               ; frames [0, 1413) reserved: static data
-                                        ; (TCBs, queues, idle stack, M4T) ends at
-                                        ; 1029417, which reaches into frame 1412
+    .equ RES_END,    1415               ; frames [0, 1415) reserved: static data
+                                        ; (TCBs, queues, idle stack, M4T, CTAB, EPT)
+                                        ; ends at 1031085, inside frame 1414
     .equ STK_LO,     6446
     .equ STK_HI,     6448
     .equ KSTACK,     4700001
-    .equ FREE_FRAMES, 5145              ; 6561 - 1413(reserved) - 3(stack)
+    .equ FREE_FRAMES, 5143              ; 6561 - 1415(reserved) - 3(stack)
     .equ FREE_TEST,   240               ; boot self-test allocation count
 
 ; ---- scheduler constants (D-033/D-034) ---------------------------------------
     .equ QUANTUM,   500                 ; timer cycles per scheduling slice
     .equ NT,        27                  ; thread slots (tid 0 = idle, 1 = main)
-    ; TCB layout: 8 words (24 trytes) per slot
-    .equ T_NEXT,    0                   ; ready-queue / free-list link (0 = none)
+    ; TCB layout: 12 words (36 trytes) per slot
+    .equ T_NEXT,    0                   ; ready-queue / free-list / wait-queue link
     .equ T_SP,      3                   ; saved kernel SP (trap frame top)
     .equ T_EPC,     6                   ; saved EPC (resume address)
     .equ T_STATE,   9                   ; -2 free slot, -1 blocked, 0 ready, 1 running
@@ -53,15 +53,18 @@
     .equ T_PEND,    15                  ; pending-wake flag (D-036)
     .equ T_STK,     18                  ; stack frame base PA (0 = static)
     .equ T_FLAGS,   21                  ; bit0: static stack (never freed)
-    .equ TCBS,      1028310             ; NT * 24 trytes
-    .equ QHEADS,    TCBS + 648          ; 6 words: head/tail per class (-1,0,+1)
+    .equ T_WEP,     24                  ; endpoint obj this thread waits on
+    .equ T_ROLE,    27                  ; 0 none, -1 sender, +1 receiver, +2 call-await
+    .equ T_CALLER,  30                  ; reserved (M6)
+    .equ TCBS,      1028310             ; NT * 36 trytes
+    .equ QHEADS,    TCBS + 972          ; 6 words: head/tail per class (-1,0,+1)
     .equ CURRENT,   QHEADS + 18         ; word: running tid (-1 = none, 0 = idle)
     .equ FREE_TID,  CURRENT + 3         ; word: free TCB list head
     .equ DONE,      FREE_TID + 3        ; NT words: worker completion flags
     .equ STRESS,    DONE + 81           ; NT words: yield-stress counters
     .equ IDLE_STK,  STRESS + 81         ; 243 trytes idle stack (static)
     .equ IDLE_STK_TOP, IDLE_STK + 243
-    .equ M4T,       IDLE_STK_TOP        ; 10 words: main's per-phase tid slots
+    .equ M4T,       IDLE_STK_TOP        ; main's per-phase slots
     .equ P1A,       M4T
     .equ P1B,       M4T + 3
     .equ P1C,       M4T + 6
@@ -74,6 +77,39 @@
     .equ P4C,       M4T + 27
     .equ WDONE,     M4T + 30            ; 12 words: worker completion flags,
                                         ; indexed by the create argument
+    .equ XCAP,      M4T + 66            ; self-test capability refs (4 words)
+    .equ XCHILD,    M4T + 69
+    .equ XGRAND,    M4T + 72
+    .equ XC2,       M4T + 75
+
+; ---- capability / endpoint tables (D-037..D-039) ------------------------------
+    .equ NSLOT,     81                  ; capability slots (3^4)
+    .equ CTAB,      M4T + 78            ; NSLOT x 18 trytes: gen, type, obj,
+                                        ; rights, badge, parent (-1 = root)
+    .equ CE_TYPE,   3                   ; 0 free, 1 endpoint
+    .equ CE_OBJ,    6
+    .equ CE_RIGHTS, 9                   ; 9 rights x 2-trit group, order - < 0 < +
+    .equ CE_BADGE,  12
+    .equ CE_PARENT, 15
+    .equ NEP,       9                   ; endpoint objects
+    .equ EPT,       CTAB + 1458         ; NEP x 18 trytes: used, rq_h, rq_t,
+                                        ; sq_h, sq_t, caller
+    .equ EE_RQH,    3                   ; receiver-waiting queue head/tail
+    .equ EE_RQT,    6
+    .equ EE_SQH,    9                   ; sender-waiting queue head/tail
+    .equ EE_SQT,    12
+    .equ EE_CALLER, 15                  ; tid of the CALL thread awaiting REPLY
+    .equ R_READ,    0                   ; right indices (docs/04 order)
+    .equ R_WRITE,   1
+    .equ R_EXEC,    2
+    .equ R_GRANT,   3
+    .equ R_MAP,     4
+    .equ R_SEND,    5
+    .equ R_RECV,    6
+    .equ R_CALL,    7
+    .equ R_CONTROL, 8
+    .equ RIGHT_ALL, 48427561            ; sum of 9^i for i in 0..8: every right +
+    .equ RIGHT_NOSEND, 48309463         ; RIGHT_ALL with SEND = -1
 
     .org KERNEL_LOAD
     .entry main
@@ -151,6 +187,10 @@ st_alloc2_done:
     JMP bt_trap_demo
 st_fail:
     const R1, str_buddy_fail
+    call puts
+
+st_fail2:
+    const R1, str_test_fail
     call puts
 
 ; ---- trap demo: illegal word then DIV0, kernel must survive both (D-031) ----
@@ -264,6 +304,26 @@ th_sys:
     BRZ R5, sys_putc
     CMPI3 R5, R1, 7
     BRZ R5, sys_gettid
+    CMPI3 R5, R1, 8
+    BRZ R5, sys_send
+    CMPI3 R5, R1, 9
+    BRZ R5, sys_recv
+    CMPI3 R5, R1, 10
+    BRZ R5, sys_call
+    CMPI3 R5, R1, 11
+    BRZ R5, sys_reply
+    CMPI3 R5, R1, 12
+    BRZ R5, sys_nbsend
+    CMPI3 R5, R1, 13
+    BRZ R5, sys_cap_derive
+    CMPI3 R5, R1, 14
+    BRZ R5, sys_cap_copy
+    CMPI3 R5, R1, 15
+    BRZ R5, sys_cap_revoke
+    CMPI3 R5, R1, 16
+    BRZ R5, sys_cap_delete
+    CMPI3 R5, R1, 17
+    BRZ R5, sys_ep_create
     const R1, str_badcall
     call puts
     JMP th_resume
@@ -372,6 +432,618 @@ sys_gettid:
     JMP th_resume
 
 ; ------------------------------------------------------------------------------
+; M5: endpoints, capabilities, IPC (D-037..D-039).
+; Handlers run in trap context (IRQs off): queue and handoff operations are
+; atomic. IPC frame layout: cap in the +18 slot (interrupted R2), two message
+; words in +15/+12 (interrupted R3/R4); results: status in +21 (R1), error
+; detail in +18 (R2), delivered words in +15/+12.
+; ------------------------------------------------------------------------------
+cap_check:                           ; R1 = cap ref, R2 = right index
+    push R2                          ; -> R1 = &entry or -1 (right must be +)
+    push R5                          ; clobbers R3; preserves R2, R4, R6
+    CMPI3 R5, R1, 0
+    BRN R5, cc_bad
+    CMPI3 R5, R1, NSLOT
+    BRZP R5, cc_bad
+    MULI R3, R1, 18
+    const R5, CTAB
+    ADD R1, R5, R3                   ; R1 = &entry
+    LEA R5, R1, 3
+    LDW R3, R5                       ; type
+    CMPI3 R5, R3, 0
+    BRZ R5, cc_bad                   ; free slot
+    MULI R3, R2, 2                   ; shift = 2 * right index
+    LEA R5, R1, 9
+    LDW R5, R5                       ; rights word
+    TSHR R5, R5, R3                  ; drop 2*idx lowest trits (reg-form shift)
+    LDI R3, 9
+    MOD R5, R5, R3                   ; balanced pair in [-4, 4]
+    CMPI3 R5, R5, 1
+    BRZ R5, cc_ok                    ; right held (+)
+cc_bad:
+    LDI R1, -1
+cc_ok:
+    pop R5
+    pop R2
+    ret
+
+ep_dequeue:                          ; R1 = &head, R2 = &tail -> R6 = tid (0 empty)
+    LDW R6, R1                       ; clobbers R3, R5; preserves R1, R2, R4
+    CMPI3 R5, R6, 0
+    BRZ R5, ed_out
+    push R1
+    push R2
+    ADD R1, R6, R0
+    call tcb_addr
+    LDW R3, R1                       ; TCB[tid].next
+    pop R2
+    pop R1
+    STW R1, R3                       ; head = next
+    CMPI3 R5, R3, 0
+    BRZ R5, ed_z
+    JMP ed_out
+ed_z:
+    STW R2, R0                       ; tail = 0 (queue drained)
+ed_out:
+    ret
+
+wait_push:                           ; R1 = &head, R2 = &tail, R3 = tid
+    push R1                          ; the pushed thread's own next link must be
+    push R2                          ; cleared too, or its stale free-list/queue
+    push R4                          ; link poisons the queue on the dequeue
+    push R7
+    ADD R1, R3, R0
+    call tcb_addr                    ; R1 = &TCB[tid]
+    STW R1, R0                       ; TCB[tid].next = 0
+    pop R1
+    LDW R5, R2                       ; tail
+    CMPI3 R4, R5, 0
+    BRZ R4, wp_empty
+    ADD R1, R5, R0
+    call tcb_addr                    ; R1 = &TCB[tail]
+    STW R1, R3                       ; TCB[tail].next = tid
+    JMP wp_link
+wp_empty:
+    STW R1, R3                       ; head = tid
+wp_link:
+    ADD R1, R2, R0
+    STW R1, R3                       ; tail = tid
+    pop R7
+    pop R4
+    pop R2
+    pop R1
+    ret
+
+ipc_deliver:                         ; R1 = &target TCB: copy the current frame's
+    LEA R5, R1, 3                    ; msg words (+15/+12) into the target's
+    LDW R5, R5                       ; frame and set its status slot (+21) to 0.
+    LEA R2, R8, 15                   ; No pushes here: they would shift R8 and
+    LDW R2, R2                       ; mispoint the R8-relative reads below.
+    LEA R3, R5, 15
+    STW R3, R2
+    LEA R2, R8, 12
+    LDW R2, R2
+    LEA R3, R5, 12
+    STW R3, R2
+    LDI R2, 0
+    LEA R3, R5, 21
+    STW R3, R2
+    ret
+
+ipc_take:                            ; R1 = &sender TCB: copy the sender's msg
+    LEA R5, R1, 3                    ; words into the current frame, status 0.
+    LDW R5, R5                       ; No pushes: same R8-shift hazard as above.
+    LEA R2, R5, 15
+    LDW R2, R2
+    LEA R3, R8, 15
+    STW R3, R2
+    LEA R2, R5, 12
+    LDW R2, R2
+    LEA R3, R8, 12
+    STW R3, R2
+    LDI R2, 0
+    LEA R3, R8, 21
+    STW R3, R2
+    ret
+
+cap_alloc:                           ; -> R1 = free slot or -1
+    push R4                          ; clobbers R2, R3, R5; preserves R4, R6
+    LDI R4, 0
+ca_loop:
+    MULI R2, R4, 18
+    const R3, CTAB
+    ADD R2, R3, R2
+    LEA R3, R2, 3
+    LDW R3, R3                       ; type
+    CMPI3 R5, R3, 0
+    BRZ R5, ca_ok
+    ADDI R4, R4, 1
+    CMPI3 R5, R4, NSLOT
+    BRN R5, ca_loop
+    LDI R1, -1
+    pop R4
+    ret
+ca_ok:
+    ADD R1, R4, R0
+    pop R4
+    ret
+
+ipc_err:                             ; status -1, detail -1 (bad cap / rights)
+    LDI R3, -1
+    LEA R5, R8, 21
+    STW R5, R3
+    LEA R5, R8, 18
+    STW R5, R3
+    JMP th_resume
+
+ipc_err2:                            ; status -1, detail -2 (no receiver)
+    LDI R3, -1
+    LEA R5, R8, 21
+    STW R5, R3
+    LDI R3, -2
+    LEA R5, R8, 18
+    STW R5, R3
+    JMP th_resume
+
+ipc_err3:                            ; status -1, detail -3 (no caller)
+    LDI R3, -1
+    LEA R5, R8, 21
+    STW R5, R3
+    LDI R3, -3
+    LEA R5, R8, 18
+    STW R5, R3
+    JMP th_resume
+
+ipc_ok:                              ; status 0, detail 0
+    LDI R3, 0
+    LEA R5, R8, 21
+    STW R5, R3
+    LEA R5, R8, 18
+    STW R5, R3
+    JMP th_resume
+
+sys_send:                            ; frame: cap +18, msg +15/+12; right SEND
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 5
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LEA R2, R1, 6
+    LDW R2, R2                       ; endpoint obj (R2 survives tcb_addr)
+    MULI R3, R2, 18
+    const R4, EPT
+    ADD R4, R4, R3                   ; R4 = &EPT[e]
+    LEA R1, R4, EE_RQH
+    LEA R2, R4, EE_RQT
+    call ep_dequeue                  ; R6 = waiting receiver or 0
+    CMPI3 R5, R6, 0
+    BRZ R5, sys_send_blk
+    ADD R1, R6, R0
+    call tcb_addr
+    call ipc_deliver                 ; msg -> receiver frame
+    ADD R1, R6, R0
+    call sched_enqueue               ; wake the receiver
+    JMP ipc_ok
+sys_send_blk:
+    const R5, CURRENT
+    LDW R5, R5
+    ADD R1, R5, R0
+    call tcb_addr                    ; R1 = &TCB[cur]
+    LEA R3, R1, 24
+    STW R3, R2                       ; T_WEP = ep
+    LDI R2, -1
+    LEA R3, R1, 9
+    STW R3, R2                       ; state = blocked
+    LDI R2, -1
+    LEA R3, R1, 27
+    STW R3, R2                       ; role = sender
+    LEA R1, R4, EE_SQH
+    LEA R2, R4, EE_SQT
+    const R3, CURRENT
+    LDW R3, R3
+    call wait_push
+    call schedule_switch             ; never returns
+
+sys_recv:                            ; frame: cap +18; right RECV
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 6
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LEA R2, R1, 6
+    LDW R2, R2
+    MULI R3, R2, 18
+    const R4, EPT
+    ADD R4, R4, R3
+    LEA R1, R4, EE_SQH
+    LEA R2, R4, EE_SQT
+    call ep_dequeue                  ; R6 = waiting sender or 0
+    CMPI3 R5, R6, 0
+    BRZ R5, sys_recv_blk
+    ADD R1, R6, R0
+    call tcb_addr                    ; R1 = &TCB[sender]
+    call ipc_take                    ; sender msg -> my frame, status ok
+    LEA R3, R1, 27
+    LDW R3, R3                       ; sender role
+    CMPI3 R5, R3, 2
+    BRZ R5, sys_recv_caller          ; CALL sender: stays blocked, becomes caller
+    ADD R1, R6, R0
+    call sched_enqueue               ; plain sender: wake it
+    JMP ipc_ok
+sys_recv_caller:
+    LEA R3, R4, EE_CALLER
+    STW R3, R6                       ; endpoint caller = sender tid
+    JMP ipc_ok
+sys_recv_blk:
+    const R5, CURRENT
+    LDW R5, R5
+    ADD R1, R5, R0
+    call tcb_addr
+    LEA R3, R1, 24
+    STW R3, R2                       ; T_WEP = ep
+    LDI R2, -1
+    LEA R3, R1, 9
+    STW R3, R2                       ; state = blocked
+    LDI R2, 1
+    LEA R3, R1, 27
+    STW R3, R2                       ; role = receiver
+    LEA R1, R4, EE_RQH
+    LEA R2, R4, EE_RQT
+    const R3, CURRENT
+    LDW R3, R3
+    call wait_push
+    call schedule_switch             ; never returns
+
+sys_call:                            ; frame: cap +18, msg +15/+12; right CALL
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 7
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LEA R2, R1, 6
+    LDW R2, R2
+    MULI R3, R2, 18
+    const R4, EPT
+    ADD R4, R4, R3
+    LEA R1, R4, EE_RQH
+    LEA R2, R4, EE_RQT
+    call ep_dequeue                  ; R6 = waiting server or 0
+    CMPI3 R5, R6, 0
+    BRZ R5, sys_call_blk
+    ADD R1, R6, R0
+    call tcb_addr
+    call ipc_deliver                 ; msg -> server frame
+    LEA R3, R4, EE_CALLER
+    const R2, CURRENT
+    LDW R2, R2
+    STW R3, R2                       ; endpoint caller = me
+    const R2, CURRENT
+    LDW R2, R2
+    ADD R1, R2, R0
+    call tcb_addr
+    LDI R2, -1
+    LEA R3, R1, 9
+    STW R3, R2                       ; state = blocked (awaiting REPLY)
+    LDI R2, 2
+    LEA R3, R1, 27
+    STW R3, R2                       ; role = call-await
+    call schedule_switch             ; never returns
+sys_call_blk:
+    const R5, CURRENT
+    LDW R5, R5
+    ADD R1, R5, R0
+    call tcb_addr
+    LEA R3, R1, 24
+    STW R3, R2                       ; T_WEP = ep
+    LDI R2, -1
+    LEA R3, R1, 9
+    STW R3, R2                       ; state = blocked
+    LDI R2, 2
+    LEA R3, R1, 27
+    STW R3, R2                       ; role = call sender
+    LEA R1, R4, EE_SQH
+    LEA R2, R4, EE_SQT
+    const R3, CURRENT
+    LDW R3, R3
+    call wait_push
+    call schedule_switch             ; never returns
+
+sys_reply:                           ; frame: cap +18, reply +15/+12; right CALL
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 7
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LEA R2, R1, 6
+    LDW R2, R2
+    MULI R3, R2, 18
+    const R4, EPT
+    ADD R4, R4, R3
+    LEA R3, R4, EE_CALLER
+    LDW R6, R3                       ; caller tid
+    CMPI3 R5, R6, 0
+    BRZ R5, ipc_err3
+    ADD R1, R6, R0
+    call tcb_addr
+    call ipc_deliver                 ; reply -> caller frame (status ok)
+    ADD R1, R6, R0
+    call sched_enqueue               ; wake the caller
+    LEA R3, R4, EE_CALLER
+    STW R3, R0                       ; caller = 0
+    JMP ipc_ok
+
+sys_nbsend:                          ; frame: cap +18, msg +15/+12; right SEND
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 5
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LEA R2, R1, 6
+    LDW R2, R2
+    MULI R3, R2, 18
+    const R4, EPT
+    ADD R4, R4, R3
+    LEA R1, R4, EE_RQH
+    LEA R2, R4, EE_RQT
+    call ep_dequeue
+    CMPI3 R5, R6, 0
+    BRZ R5, ipc_err2                 ; no receiver: report, keep running
+    ADD R1, R6, R0
+    call tcb_addr
+    call ipc_deliver
+    ADD R1, R6, R0
+    call sched_enqueue
+    JMP ipc_ok
+
+sys_ep_create:                       ; frame: badge +18 -> R1 = cap ref
+    LDI R4, 0
+ec_scan:
+    MULI R2, R4, 18
+    const R3, EPT
+    ADD R2, R3, R2
+    LDW R3, R2                       ; used
+    CMPI3 R5, R3, 0
+    BRZ R5, ec_found
+    ADDI R4, R4, 1
+    CMPI3 R5, R4, NEP
+    BRN R5, ec_scan
+    JMP ipc_err                      ; endpoints exhausted
+ec_found:
+    LDI R3, 1
+    STW R2, R3                       ; used = 1
+    ADDI R2, R2, 3
+    STW R2, R0                       ; rq_h = 0
+    ADDI R2, R2, 3
+    STW R2, R0                       ; rq_t = 0
+    ADDI R2, R2, 3
+    STW R2, R0                       ; sq_h = 0
+    ADDI R2, R2, 3
+    STW R2, R0                       ; sq_t = 0
+    ADDI R2, R2, 3
+    STW R2, R0                       ; caller = 0
+    call cap_alloc                   ; R1 = slot or -1
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    MULI R2, R1, 18
+    const R3, CTAB
+    ADD R2, R3, R2                   ; &entry
+    LDI R3, 1
+    STW R2, R3                       ; gen = 1
+    LEA R3, R2, 3
+    LDI R5, 1
+    STW R3, R5                       ; type = endpoint
+    LEA R3, R2, 6
+    STW R3, R4                       ; obj = endpoint index
+    LEA R3, R2, 9
+    const R5, RIGHT_ALL
+    STW R3, R5                       ; rights = every right +
+    LEA R3, R2, 12
+    LEA R5, R8, 18
+    LDW R5, R5
+    STW R3, R5                       ; badge = argument
+    LEA R3, R2, 15
+    LDI R5, -1
+    STW R3, R5                       ; parent = root
+    LEA R3, R8, 21
+    STW R3, R1                       ; result R1 = cap ref
+    LDI R1, 0
+    LEA R3, R8, 18
+    STW R3, R1                       ; error R2 = 0
+    JMP th_resume
+
+sys_cap_derive:                      ; frame: parent +18, requested rights +15
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 3                        ; GRANT gates derivation
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LEA R2, R1, 9
+    LDW R3, R2                       ; parent rights word
+    LEA R2, R1, 6
+    LDW R2, R2                       ; obj
+    push R2
+    LEA R2, R1, 12
+    LDW R2, R2                       ; badge
+    push R2
+    LEA R1, R8, 21                   ; requested rights word: the two pushes
+    LDW R1, R1                       ; shifted R8 by -6, so frame +15 = R8 + 21
+    LDI R6, 16                       ; shift of the highest group (right 8)
+    LDI R5, 0                        ; child rights word
+cd_loop:
+    TSHR R4, R3, R6                  ; parent group (reg-form shift)
+    TSHR R7, R1, R6                  ; requested group
+    LDI R2, 9
+    MOD R4, R4, R2
+    MOD R7, R7, R2                   ; both as balanced pairs in [-4, 4]
+    CMPI3 R2, R7, -1
+    BRN R2, cd_bad2
+    CMPI3 R2, R7, 1
+    BRP R2, cd_bad2
+    CMP3 R2, R4, R7                  ; min(parent, requested), order - < 0 < +
+    BRZP R2, cd_req
+    JMP cd_min
+cd_req:
+    ADD R4, R7, R0
+cd_min:
+    MULI R5, R5, 9
+    ADD R5, R5, R4                   ; child word = child * 9 + group
+    ADDI R6, R6, -2                  ; next lower group (9 groups: 16..0)
+    CMPI3 R2, R6, -2
+    BRZ R2, cd_built
+    JMP cd_loop
+cd_built:
+    ADD R6, R5, R0                   ; child rights word (cap_alloc clobbers R5)
+    call cap_alloc                   ; R1 = slot or -1 (preserves R6)
+    CMPI3 R5, R1, 0
+    BRN R5, cd_bad2
+    ADD R7, R1, R0                   ; child slot (R7 free: handlers never ret)
+    MULI R2, R7, 18
+    const R3, CTAB
+    ADD R2, R3, R2                   ; &child
+    LDI R3, 1
+    STW R2, R3                       ; gen = 1
+    pop R5                           ; badge (pushed last)
+    pop R4                           ; obj
+    LEA R3, R2, 12
+    STW R3, R5                       ; badge
+    LEA R3, R2, 6
+    STW R3, R4                       ; obj
+    LEA R3, R2, 9
+    STW R3, R6                       ; rights = child word
+    ; type and parent come from the parent entry
+    LEA R1, R8, 18
+    LDW R1, R1                       ; parent ref
+    MULI R3, R1, 18
+    const R4, CTAB
+    ADD R4, R4, R3                   ; &parent
+    LEA R3, R4, 3
+    LDW R3, R3                       ; type
+    LEA R5, R2, 3
+    STW R5, R3                       ; child type
+    LEA R5, R2, 15
+    STW R5, R1                       ; child parent = parent slot
+    LEA R3, R8, 21
+    STW R3, R7                       ; result R1 = child slot
+    LDI R3, 0
+    LEA R5, R8, 18
+    STW R5, R3                       ; error R2 = 0
+    JMP th_resume
+cd_bad2:
+    pop R5                           ; badge
+    pop R4                           ; obj
+    JMP ipc_err
+
+sys_cap_copy:                        ; frame: parent +18; right GRANT
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 3
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    ADD R7, R1, R0                   ; &parent (cap_alloc preserves R7)
+    call cap_alloc                   ; R1 = child slot or -1
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    MULI R2, R1, 18
+    const R3, CTAB
+    ADD R2, R3, R2                   ; &child
+    LEA R3, R7, 3
+    LDW R4, R3                       ; type
+    LEA R5, R2, 3
+    STW R5, R4
+    LEA R3, R7, 6
+    LDW R4, R3                       ; obj
+    LEA R5, R2, 6
+    STW R5, R4
+    LEA R3, R7, 9
+    LDW R4, R3                       ; rights (verbatim copy)
+    LEA R5, R2, 9
+    STW R5, R4
+    LEA R3, R7, 12
+    LDW R4, R3                       ; badge
+    LEA R5, R2, 12
+    STW R5, R4
+    LEA R5, R2, 0
+    LDI R4, 1
+    STW R5, R4                       ; gen = 1
+    LEA R5, R2, 15
+    LEA R3, R8, 18
+    LDW R3, R3
+    STW R5, R3                       ; parent = parent slot
+    LEA R3, R8, 21
+    STW R3, R1                       ; result R1 = child slot
+    LDI R3, 0
+    LEA R5, R8, 18
+    STW R5, R3                       ; error R2 = 0
+    JMP th_resume
+
+sys_cap_revoke:                      ; frame: target +18; right GRANT
+    LEA R1, R8, 18
+    LDW R1, R1
+    ADD R6, R1, R0                   ; target slot
+    LDI R2, 3
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LDI R4, 0                        ; s = 0
+rv_slot:
+    CMP3 R5, R4, R6
+    BRZ R5, rv_next                  ; never revoke the target itself
+    ADD R2, R4, R0                   ; p = s (walk the parent chain)
+rv_walk:
+    CMPI3 R5, R2, 0
+    BRN R5, rv_next
+    CMPI3 R5, R2, NSLOT
+    BRZP R5, rv_next
+    MULI R3, R2, 18
+    const R5, CTAB
+    ADD R3, R5, R3                   ; &entry[p]
+    LEA R5, R3, 3
+    LDW R5, R5                       ; type
+    CMPI3 R5, R5, 0
+    BRZ R5, rv_next                  ; dead chain -> not descended
+    LEA R5, R3, 15
+    LDW R2, R5                       ; p = parent
+    CMPI3 R5, R2, -1
+    BRZ R5, rv_next                  ; reached a root -> stop
+    CMP3 R5, R2, R6
+    BRZ R5, rv_hit                   ; descended from the target
+    JMP rv_walk
+rv_hit:
+    MULI R3, R4, 18
+    const R5, CTAB
+    ADD R3, R5, R3                   ; &entry[s]
+    LEA R5, R3, 0
+    LDW R2, R5
+    ADDI R2, R2, 1
+    STW R5, R2                       ; gen++
+    LEA R5, R3, 3
+    STW R5, R0                       ; type = free
+rv_next:
+    ADDI R4, R4, 1
+    CMPI3 R5, R4, NSLOT
+    BRN R5, rv_slot
+    JMP ipc_ok
+
+sys_cap_delete:                      ; frame: target +18; right GRANT
+    LEA R1, R8, 18
+    LDW R1, R1
+    LDI R2, 3
+    call cap_check
+    CMPI3 R5, R1, 0
+    BRN R5, ipc_err
+    LDW R2, R1                       ; gen
+    ADDI R2, R2, 1
+    STW R1, R2                       ; gen++
+    LEA R3, R1, 3
+    STW R3, R0                       ; type = free
+    JMP ipc_ok
 ; console helpers (clobber only caller-saved regs + R7 via call)
 ; ------------------------------------------------------------------------------
 putc:                                ; R1 = tryte
@@ -821,7 +1493,7 @@ bf_out:
 tcb_addr:                            ; R1 = tid -> R1 = &TCB (preserves R2..R6)
     push R2
     push R3
-    MULI R2, R1, 24
+    MULI R2, R1, 36
     const R3, TCBS
     ADD R1, R3, R2
     pop R3
@@ -854,6 +1526,13 @@ si_state:
     LDI R2, -2
     LEA R3, R1, 9
     STW R3, R2                       ; state = free slot
+    LDI R2, 0
+    LEA R3, R1, 24
+    STW R3, R2                       ; T_WEP = 0
+    LEA R3, R1, 27
+    STW R3, R2                       ; T_ROLE = 0
+    LEA R3, R1, 30
+    STW R3, R2                       ; T_CALLER = 0
     ADDI R4, R4, 1
     CMPI3 R5, R4, NT
     BRN R5, si_chain
@@ -893,6 +1572,50 @@ si_zs:
     ADDI R4, R4, 1
     CMPI3 R5, R4, NT
     BRN R5, si_zs
+    ; capability table: all slots free (gen = 1, parent = -1)
+    const R1, CTAB
+    LDI R4, 0
+si_ct:
+    MULI R3, R4, 18
+    ADD R3, R1, R3                   ; &entry
+    LDI R2, 1
+    STW R3, R2                       ; gen = 1
+    LEA R5, R3, 3
+    LDI R2, 0
+    STW R5, R2                       ; type = free
+    LEA R5, R3, 6
+    STW R5, R2                       ; obj = 0
+    LEA R5, R3, 9
+    STW R5, R2                       ; rights = 0
+    LEA R5, R3, 12
+    STW R5, R2                       ; badge = 0
+    LEA R5, R3, 15
+    LDI R2, -1
+    STW R5, R2                       ; parent = root
+    ADDI R4, R4, 1
+    CMPI3 R5, R4, NSLOT
+    BRN R5, si_ct
+    ; endpoint table: all free
+    const R1, EPT
+    LDI R4, 0
+si_ep:
+    MULI R3, R4, 18
+    ADD R3, R1, R3
+    LDI R2, 0
+    STW R3, R2                       ; used = 0
+    LEA R5, R3, 3
+    STW R5, R2                       ; rq_h
+    LEA R5, R3, 6
+    STW R5, R2                       ; rq_t
+    LEA R5, R3, 9
+    STW R5, R2                       ; sq_h
+    LEA R5, R3, 12
+    STW R5, R2                       ; sq_t
+    LEA R5, R3, 15
+    STW R5, R2                       ; caller
+    ADDI R4, R4, 1
+    CMPI3 R5, R4, NEP
+    BRN R5, si_ep
     pop R7
     pop R6
     pop R5
@@ -1070,6 +1793,17 @@ sys_create_body:                     ; R1 = fn, R2 = class, R3 = arg
     ADD R6, R2, R0                   ; class
     push R3                          ; arg      (old SP - 3)
     push R7                          ; LR       (old SP - 6)
+    ; validate the arguments: fn must point into the kernel text segment,
+    ; class must be a trit (-1/0/+1); anything else is a clean error
+    CMPI3 R3, R5, KERNEL_LOAD
+    BRN R3, scr_fail
+    const R2, STRBASE
+    CMP3 R3, R5, R2
+    BRZP R3, scr_fail
+    CMPI3 R3, R6, -1
+    BRN R3, scr_fail
+    CMPI3 R3, R6, 1
+    BRP R3, scr_fail
     const R1, FREE_TID
     LDW R1, R1                       ; free slot (0 = exhausted)
     CMPI3 R3, R1, 0
@@ -1259,6 +1993,10 @@ scb_do_block:
     STW R2, R3                       ; state = blocked
     call schedule_switch             ; never returns
 scb_wake:
+    CMPI3 R3, R5, 0
+    BRN R3, scb_bad
+    CMPI3 R3, R5, NT
+    BRZP R3, scb_bad
     ADD R1, R5, R0
     call tcb_addr
     LEA R2, R1, 9
@@ -1489,6 +2227,19 @@ wr_done:
     LDI R1, 2                        ; EXIT
     TRAP 0
 
+; wr_server — R1 = endpoint cap: RECV, reply(msg+1), forever (ping-pong server)
+wr_server:
+    ADD R6, R1, R0                   ; cap
+srv_loop:
+    LDI R1, 9                        ; RECV
+    ADD R2, R6, R0
+    TRAP 0                           ; R1 = 0 ok, R3/R4 = request
+    ADDI R3, R3, 1                   ; reply = request + 1
+    LDI R1, 11                       ; REPLY
+    ADD R2, R6, R0
+    TRAP 0
+    JMP srv_loop
+
 ; ------------------------------------------------------------------------------
 ; m4_main — the main thread (tid 1): scheduler self-test
 ; ------------------------------------------------------------------------------
@@ -1654,6 +2405,128 @@ m4_main:
     call wait1
     const R1, str_p4ok
     call puts
+
+    ; ---- phase 5: endpoint + capability algebra (deny sticks, revoke subtree) --
+    LDI R1, 17                       ; EP_CREATE
+    LDI R2, 7                        ; badge
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    const R3, XCAP
+    STW R3, R1
+    const R3, XCAP
+    LDW R2, R3                       ; parent = master
+    const R3, RIGHT_ALL              ; request every right
+    LDI R1, 13                       ; CAP_DERIVE
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    const R3, XCHILD
+    STW R3, R1
+    const R3, XCHILD
+    LDW R2, R3
+    const R3, RIGHT_ALL
+    LDI R1, 13
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    const R3, XGRAND
+    STW R3, R1
+    const R3, XCHILD
+    LDW R2, R3
+    LDI R1, 15                       ; CAP_REVOKE the child subtree
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    const R3, XGRAND
+    LDW R2, R3
+    LDI R1, 16                       ; CAP_DELETE on the revoked grandchild
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRZ R5, st_fail2                 ; must fail: the slot is gone
+    ; deny sticks: c2 = derive(master, SEND=-1), then request SEND=+ via c2
+    const R3, XCAP
+    LDW R2, R3
+    const R3, RIGHT_NOSEND
+    LDI R1, 13
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    const R3, XC2
+    STW R3, R1
+    const R3, XC2
+    LDW R2, R3
+    const R3, RIGHT_ALL              ; must NOT override the deny
+    LDI R1, 13
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    ADD R6, R1, R0                   ; g2 cap
+    ADD R2, R6, R0
+    LDI R3, 0
+    LDI R4, 0
+    LDI R1, 8                        ; SEND via g2 -> denied
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRZ R5, st_fail2                 ; must fail
+    CMPI3 R5, R2, -1
+    BRN R5, st_fail2                 ; detail: bad cap/rights
+    const R1, str_caps_ok
+    call puts
+
+    ; ---- phase 6: CALL/REPLY ping-pong on the master endpoint ----
+    const R3, XCAP
+    LDW R6, R3                       ; master cap
+    const R2, wr_server
+    LDI R3, 0                        ; normal class
+    ADD R4, R6, R0                   ; arg = the cap
+    LDI R1, 3                        ; THREAD_CREATE
+    TRAP 0
+    LDI R1, 5                        ; TIME
+    TRAP 0
+    ADD R7, R1, R0                   ; t0
+    LDI R5, 0                        ; i
+pp_loop:
+    ADD R3, R5, R0                   ; request = i
+    LDI R4, 0
+    ADD R2, R6, R0                   ; cap
+    LDI R1, 10                       ; CALL
+    TRAP 0                           ; R1 = 0 ok, R3 = reply = i + 1
+    ADDI R2, R5, 1
+    CMP3 R2, R3, R2
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 200
+    BRN R2, pp_loop
+    LDI R1, 5                        ; TIME
+    TRAP 0
+    SUB R5, R1, R7                   ; elapsed ticks
+    const R1, str_ipc
+    call puts
+    ADD R1, R5, R0
+    call putnum
+    LDI R1, 10
+    call putc
+
+    ; ---- phase 7: syscall argument fuzz (the kernel must survive) ----
+    LDI R5, 0                        ; row index
+fz_loop:
+    MULI R2, R5, 12
+    const R3, FTAB
+    ADD R2, R3, R2
+    LDW R1, R2                       ; num
+    LEA R2, R2, 3
+    LDW R2, R2                       ; arg1
+    LEA R2, R2, 3
+    LDW R3, R2                       ; arg2
+    LEA R2, R2, 3
+    LDW R4, R2                       ; arg3
+    TRAP 0
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, FZROWS
+    BRN R2, fz_loop
+    const R1, str_fuzz_ok
+    call puts
     const R1, str_ready
     call puts
     const R1, POWER
@@ -1706,6 +2579,28 @@ str_p2ok:        .asciz "p2 ok\n"
 str_p3ok:        .asciz "p3 ok\n"
 str_p4ok:        .asciz "stress ok\n"
 str_badcall:     .asciz "bad syscall\n"
+str_caps_ok:     .asciz "caps: ok\n"
+str_ipc:         .asciz "ipc: 200 calls / "
+str_fuzz_ok:     .asciz "fuzz: ok\n"
+str_test_fail:   .asciz "self-test: FAIL\n"
+.equ FZROWS,     16
+
+FTAB:   .word 8, 999, 0, 0
+        .word 8, -1, 0, 0
+        .word 9, 999, 0, 0
+        .word 10, 999, 0, 0
+        .word 11, 5, 0, 0
+        .word 12, 999, 0, 0
+        .word 13, -1, -1, 0
+        .word 13, 999, 0, 0
+        .word 14, -5, 0, 0
+        .word 15, 999, 0, 0
+        .word 15, -2, 0, 0
+        .word 16, -2, 0, 0
+        .word 4, -99, 99, 0
+        .word 4, 1, 99, 0
+        .word 3, -999, 0, 0
+        .word 5, 0, 0, 0
 
 ; BSS (D-032): the KDATA region below is never stored in the TXE — every byte of
 ; it is initialised before first read (buddy_init writes all states and hints;
