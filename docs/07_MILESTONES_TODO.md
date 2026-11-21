@@ -8,7 +8,7 @@
       boot sector loads a TXE image from disk; tridbg can step/break.
 - [x] **M3 MMU + traps + kernel boot.** Page tables, TLB, trap vector, kernel entry. *Accept:* page-fault tests (R/W/X/user/kernel),
       kernel prints banner, handles ILLEGAL/DIV0 without dying, physical buddy allocator tests.
-- [ ] **M4 Threads + scheduler.** Context switch, timer preemption, three priority classes. *Accept:* 3 threads print interleaved;
+- [x] **M4 Threads + scheduler.** Context switch, timer preemption, three priority classes. *Accept:* 3 threads print interleaved;
       realtime starves background as designed; no lost wakeups under 1M-cycle stress.
 - [ ] **M5 IPC + capabilities.** Endpoints, CALL/REPLY, cap derive/revoke with sticky deny. *Accept:* ping-pong benchmark, revoke subtree test,
       deny-override test, fuzz test of syscall arguments (kernel never panics).

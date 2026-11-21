@@ -354,3 +354,52 @@ putnum writes pnumbuf before reading.
 **Reason:** keeps the kernel image small (no 1M-tryte hole in the TXE), matches the M2
 loader semantics, and the "written before read" invariant is policed by the boot self-test
 itself — any uninitialised read shows up as a wrong alloc/free against the golden model.
+
+## D-033 — 2026-11-21 — PSW shadow + M4 scheduling model
+**Choice:** trap entry snapshots the current PSW (mode + 3·irq) into a shadow register and
+then forces mode +, irq −; RETI restores PC = EPC and mode/irq from the shadow; CSRW PSW
+also updates the shadow. This makes the handler→RETI path zero-window (no nested trap can
+clobber EPC or leak an irq-enable), so a preempted thread comes back with its interrupts
+on without any handler-side PSW write. Scheduling: three priority classes (realtime +,
+normal 0, background −), one FIFO ready queue per class, scan order +/0/−, time slice via
+the level timer re-armed to TIME+QUANTUM on every tick; the idle thread parks in WFI.
+The spec's 9 levels per class are recorded in the TCB concept but only arrive with M5
+priority inheritance.
+**Reason:** with a single EPC CSR, any irq-enable before RETI let a nested trap overwrite
+the outer EPC and turned the resume into an infinite RETI loop — observed live. The
+shadow (hardware-equivalent: a real chip saves PSW on trap entry) removes the window
+entirely; isa.yaml's "mode/irq reloaded from PSW (kernel-owned)" stays true.
+
+## D-034 — 2026-11-21 — Context switch: trap frame + TCB, save-early/restore-only
+**Choice:** every trap builds a frame on the interrupted thread's kernel stack
+(R1..R7 + saved SP slot) and immediately stores T_SP (= frame top), T_EPC and the state
+into the thread's TCB (9 words: next/sp/epc/state/class/pending/stk/flags/reserved).
+schedule_switch then only picks the best ready thread (zombie-guarded: freed slots are
+skipped), reloads EPC from the target TCB and RETIs. New threads get a synthetic frame
+(sp = stack top, R1 = create arg, R2..R7 = 0). Threads run mode +, IRQs on; handlers run
+with IRQs off by trap entry.
+**Reason:** saving before dispatch makes every switch path (timer, YIELD, EXIT, BLOCK)
+uniform; loading EPC from the TCB just before RETI keeps a stale CSR from ever mattering.
+The zombie guard converts a stale queue link (found live: a wake-enqueued freed tid) from
+a context-corrupting crash into a skipped entry.
+
+## D-035 — 2026-11-21 — M4 syscall set and frame-based argument passing
+**Choice:** TRAP 0 with the number in R1: 1 YIELD, 2 EXIT, 3 THREAD_CREATE(fn,class,arg),
+4 THREAD_CONTROL(tid,op,arg) with op 0 block / 1 wake / 2 set-class(self only),
+5 TIME, 6 DEBUG_PUTC, 7 GETTID; result in R1, error in R2 (0 = ok). Wrappers reload all
+arguments from the trap frame (+21/+18/+15/+12 = interrupted R1/R2/R3/R4) and write
+results back into the frame, because the handler's save step uses R2/R3 as scratch and
+clobbers the live registers. THREAD_CREATE allocates the TCB and a buddy order-0 stack
+page, builds the synthetic frame by direct STWs (never by switching R8), and enqueues.
+**Reason:** frame-based args survive any handler scratch use; the no-R8-switch frame
+build keeps the body preemptible at every instruction (a mid-body timer hit used to
+misalign the epilogue pops and return into the wrong stack).
+
+## D-036 — 2026-11-21 — Pending-wake flag (no lost wakeups)
+**Choice:** WAKE on a runnable thread (ready or running) sets the TCB pending flag instead
+of touching the queues; BLOCK on a thread with the flag set consumes it and keeps running.
+WAKE on a blocked thread enqueues it normally; WAKE on a freed slot is an error and never
+enqueues.
+**Reason:** the classic wake-before-block race would otherwise lose the wakeup forever;
+the flag makes THREAD_CONTROL idempotent and the M4 acceptance exercises both paths
+(pending consumed without blocking, real block/wake round-trip).

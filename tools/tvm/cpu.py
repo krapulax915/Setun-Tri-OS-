@@ -143,6 +143,7 @@ class CPU:
         self.pc = 0
         self.mode = mode                      # -1 user, 0 service, +1 kernel
         self.irq_enable = -1
+        self.psw_shadow = mode + 3 * self.irq_enable   # restored by RETI (D-033)
         self.halted = False
         self.waiting = False
         self.trap_hook = trap_hook            # used while TVEC == 0 (bare metal)
@@ -190,6 +191,7 @@ class CPU:
             irq = T.wrap((v - mode) // 3, 1)
             self.mode = mode
             self.irq_enable = irq
+            self.psw_shadow = mode + 3 * irq  # RETI restores this value (D-033)
             return True
         if num == CSR_TIMER_CMP:
             self.timer_cmp = v                  # 0 = fire immediately (level)
@@ -208,6 +210,7 @@ class CPU:
         self.csr[CSR_EPC] = epc
         self.csr[CSR_CAUSE] = cause
         self.csr[CSR_TVAL] = T.wrap(tval, 18)
+        self.psw_shadow = self.mode + 3 * self.irq_enable   # snapshot (D-033)
         self.mode = 1
         self.irq_enable = -1
         self.pc = self.csr[CSR_TVEC]
@@ -529,6 +532,9 @@ class CPU:
             if self.mode != 1:
                 raise Trap(C_PRIV, op)
             self.pc = self.csr[CSR_EPC]
+            m = T.wrap(self.psw_shadow, 1)             # mode/irq from PSW (D-033)
+            self.mode = m
+            self.irq_enable = T.wrap((self.psw_shadow - m) // 3, 1)
             return
         elif op == _OPV["WFI"]:                        # WFI (privileged)
             if self.mode != 1:

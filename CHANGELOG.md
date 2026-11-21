@@ -2,6 +2,23 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M4 — 2026-11-21 — Threads + scheduler (Triad kernel, D-033..D-036)
+- `tools/tvm/cpu.py`: PSW shadow (D-033) — trap entry snapshots mode/irq, RETI restores
+  them, CSRW PSW updates the snapshot; the handler→RETI resume path is now zero-window.
+- `kernel/kernel.asm`: the Triad scheduler — three priority classes with per-class FIFO
+  queues and timer quantum (D-033); per-thread kernel stacks from the buddy allocator;
+  TCB table, save-early/restore-only context switch with a zombie guard (D-034); M4
+  syscall set with frame-based argument passing (D-035): YIELD, EXIT, THREAD_CREATE,
+  THREAD_CONTROL (block/wake/set-class), TIME, DEBUG_PUTC, GETTID; pending-wake flag so
+  wake-before-block is never lost (D-036); idle thread parks in WFI.
+- Boot self-test: 3 threads print x/y/z interleaved under round-robin + timer preemption;
+  pending-wake consumed without blocking and a real block/wake round-trip; a realtime
+  spinner starves a background worker until it finishes, then the kernel demotes itself
+  and lets it run; 3x200 yield-stress with per-worker counters.
+- `tests/test_m4.py`: full-boot acceptance, interleave pattern, starvation ordering,
+  no-lost-wakeup markers.
+- Tests: 102 green (4 new). DECISIONS: D-033..D-036.
+
 ## M3 — 2026-11-20 — MMU, trap vector, buddy allocator, Triad kernel boot
 - `tools/tvm/mmu.py`: three-level ternary page tables (81 entries per frame,
   balanced indexing, D-029), 27-entry TLB with accessed/dirty updates on hits,

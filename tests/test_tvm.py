@@ -447,6 +447,8 @@ class TestSystemOpcodes(unittest.TestCase):
             HALT
         handler:
             LDI R6, 9
+            LDI R1, -2                ; PSW = mode +, irq -: kernel-owned PSW,
+            CSRW PSW, R1              ; else the level timer refires forever (D-033)
             RETI
         """)
         c.csr[tvcpu.CSR_TVEC] = img.symbols["handler"]
