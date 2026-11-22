@@ -42,3 +42,15 @@ of the new TCB (written before enqueue, read during frame build).
   = top-21..top-3 = the arg+zero region. Addresses check out arithmetically.
   => next: single-step the FIRST create-body frame build and dump the new
   stack region after the build, before the enqueue.
+
+## Decisive new measurement (TCB1.T_EPC watch)
+The trap-save writes T_EPC = 8304 (ep_dequeue's STW) for tid=1 with R8 = trap-frame - 12
+(handler frame build INCOMPLETE) and pc = th_nosave. Signature: a NESTED trap fired
+during a previous handler's early frame-build, and the nested trap's EPC = 8304 —
+meaning the interrupted pc WAS 8304: the CPU had already jumped INTO ep_dequeue while
+still inside the previous handler's early phase with R8 mid-build.
+=> The spurious jump INTO ep_dequeue happens from the handler's own early code, before
+the frame is complete. Prime suspect: the timer re-arm sequence in th_timer (CSRR TIME;
+const QUANTUM; ADD; CSRW TIMER_CMP) shares registers R1/R2 with the save sequence, and
+the level-timer refire during the handler (irq_enable=-1 should prevent it — verify
+irq_enable is really -1 at that point; a CSR_PSW shadow write may have re-enabled it).
