@@ -2228,15 +2228,15 @@ wr_done:
     LDI R1, 2                        ; EXIT
     TRAP 0
 
-; wr_server — R1 = endpoint cap: RECV, reply(msg+1), forever (ping-pong server)
+; wr_server — R1 = endpoint cap: RECV request, SEND reply(msg+1), forever
 wr_server:
     ADD R6, R1, R0                   ; cap
 srv_loop:
     LDI R1, 9                        ; RECV
     ADD R2, R6, R0
-    TRAP 0                           ; R1 = 0 ok, R3/R4 = request
+    TRAP 0                           ; R3/R4 = request
     ADDI R3, R3, 1                   ; reply = request + 1
-    LDI R1, 11                       ; REPLY
+    LDI R1, 8                        ; SEND
     ADD R2, R6, R0
     TRAP 0
     JMP srv_loop
@@ -2484,9 +2484,12 @@ m4_main:
     STW R3, R1
     const R2, wr_server
     LDI R3, 0                        ; normal class
-    LDW R4, R3                       ; arg = the cap
+    const R4, XC2
+    LDW R4, R4                       ; arg = the cap (XC2 holds the master ref)
     LDI R1, 3                        ; THREAD_CREATE
     TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2                 ; the create must succeed
     LDI R1, 5                        ; TIME
     TRAP 0
     ADD R7, R1, R0                   ; t0
@@ -2496,8 +2499,11 @@ pp_loop:
     LDI R4, 0
     const R3, XC2
     LDW R2, R3                       ; cap re-read every iteration
-    LDI R1, 10                       ; CALL
-    TRAP 0                           ; R1 = 0 ok, R3 = reply = i + 1
+    LDI R1, 8                        ; SEND (blocks until the server RECVs)
+    TRAP 0
+    LDI R1, 9                        ; RECV the reply
+    ADD R2, R6, R0
+    TRAP 0                           ; R3 = reply = i + 1
     ADDI R2, R5, 1
     CMP3 R2, R3, R2
     BRNZ R2, st_fail2
