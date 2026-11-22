@@ -2228,7 +2228,21 @@ wr_done:
     LDI R1, 2                        ; EXIT
     TRAP 0
 
-; wr_server — R1 = endpoint cap: RECV request, SEND reply(msg+1), forever
+; wr_consv — R1 = console cap: RECV a char, print it; request -1 = panic (EXIT)
+wr_consv:
+    ADD R6, R1, R0                   ; console cap
+cs_loop:
+    LDI R1, 9                        ; RECV
+    ADD R2, R6, R0
+    TRAP 0                           ; R3 = char
+    CMPI3 R5, R3, -1
+    BRZ R5, cs_panic
+    const R2, UART_TX
+    STT R2, R3                       ; print the char (the console owns the UART)
+    JMP cs_loop
+cs_panic:
+    LDI R1, 2                        ; EXIT
+    TRAP 0
 wr_server:
     ADD R6, R1, R0                   ; cap
 srv_loop:
@@ -2474,10 +2488,72 @@ m4_main:
     BRN R5, st_fail2                 ; detail: bad cap/rights
     const R1, str_caps_ok
     call puts
-    JMP m5_done                      ; WIP M5: phases 6-7 (ping-pong + fuzz)
-                                     ; parked — see BUG_M5_NOTES.md; the
-                                     ; CALL/REPLY-agnostic deadlock needs a
-                                     ; fresh debugging session
+
+    ; ---- M6: console server + crash + init restart (D-040) ----
+    ; (M5 phases 6-7 — CALL/REPLY ping-pong + fuzz — are parked, see
+    ;  BUG_M5_NOTES.md: the handshake deadlock needs a fresh session)
+    LDI R1, 17                       ; EP_CREATE console endpoint
+    LDI R2, 2                        ; badge
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    const R3, XGRAND
+    STW R3, R1                       ; XGRAND slot reused as the console cap
+    const R2, wr_consv
+    LDI R3, 0
+    LDW R4, R3
+    const R3, XGRAND
+    LDW R4, R3                       ; arg = console cap
+    LDI R1, 3
+    TRAP 0                           ; create the console server
+    LDI R1, 1                        ; YIELD: let it RECV-block
+    TRAP 0
+    ; echo 'A' through the console server
+    const R3, XGRAND
+    LDW R2, R3
+    LDI R3, 65                       ; 'A'
+    LDI R1, 8                        ; SEND
+    TRAP 0
+    ; echo 'B'
+    const R3, XGRAND
+    LDW R2, R3
+    LDI R3, 66
+    LDI R1, 8
+    TRAP 0
+    ; panic: the console server exits on request -1
+    const R3, XGRAND
+    LDW R2, R3
+    LDI R3, -1
+    LDI R1, 8
+    TRAP 0
+    ; the console is down: SEND must fail now
+    const R3, XGRAND
+    LDW R2, R3
+    LDI R3, 67
+    LDI R1, 8
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRZ R5, st_fail2                 ; must fail: the server crashed
+    const R1, str_condown
+    call puts
+    ; init restarts the console server on the SAME endpoint (the cap survives)
+    const R2, wr_consv
+    LDI R3, 0
+    const R3, XGRAND
+    LDW R4, R3
+    LDI R1, 3
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    LDI R1, 1                        ; YIELD: let the new server RECV-block
+    TRAP 0
+    const R3, XGRAND
+    LDW R2, R3
+    LDI R3, 82                       ; 'R'
+    LDI R1, 8
+    TRAP 0                           ; echo 'R' through the new server
+    const R1, str_restart
+    call puts
 
 m5_done:
     const R1, str_ready
@@ -2600,6 +2676,8 @@ str_badcall:     .asciz "bad syscall\n"
 str_caps_ok:     .asciz "caps: ok\n"
 str_ipc:         .asciz "ipc: 200 calls / "
 str_fuzz_ok:     .asciz "fuzz: ok\n"
+str_condown:     .asciz "init: console down\n"
+str_restart:     .asciz "init: console restarted\n"
 str_test_fail:   .asciz "self-test: FAIL\n"
 .equ FZROWS,     16
 
