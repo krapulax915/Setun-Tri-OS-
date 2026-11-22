@@ -2474,8 +2474,23 @@ m4_main:
     BRN R5, st_fail2                 ; detail: bad cap/rights
     const R1, str_caps_ok
     call puts
+    JMP m5_done                      ; WIP M5: phases 6-7 (ping-pong + fuzz)
+                                     ; parked — see BUG_M5_NOTES.md; the
+                                     ; CALL/REPLY-agnostic deadlock needs a
+                                     ; fresh debugging session
 
-    ; ---- phase 6: CALL/REPLY ping-pong on the master endpoint ----
+m5_done:
+    const R1, str_ready
+    call puts
+    const R1, POWER
+    LDI R2, 1
+    STW R1, R2                       ; clean power-off
+m4_park:
+    LDI R1, 1                        ; YIELD (only reached if power-off failed)
+    TRAP 0
+    JMP m4_park
+
+    ; ---- phase 6 (parked): CALL/REPLY ping-pong on the master endpoint ----
     ; the cap lives in XC2 (reused: phase 5 is done) and is RE-READ every
     ; iteration — a register copy would have to survive timer preemptions
     const R3, XCAP
@@ -2539,15 +2554,6 @@ fz_loop:
     BRN R2, fz_loop
     const R1, str_fuzz_ok
     call puts
-    const R1, str_ready
-    call puts
-    const R1, POWER
-    LDI R2, 1
-    STW R1, R2                       ; clean power-off
-m4_park:
-    LDI R1, 1                        ; YIELD (only reached if power-off failed)
-    TRAP 0
-    JMP m4_park
 
 wait1:                               ; R3 = &slot word holding the WDONE index:
                                      ; spin until WDONE[index] == 1

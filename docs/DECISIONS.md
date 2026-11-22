@@ -403,3 +403,36 @@ enqueues.
 **Reason:** the classic wake-before-block race would otherwise lose the wakeup forever;
 the flag makes THREAD_CONTROL idempotent and the M4 acceptance exercises both paths
 (pending consumed without blocking, real block/wake round-trip).
+
+## D-037 — 2026-11-22 — Capability table + endpoint objects (M5 kernel scope)
+**Choice:** a kernel-global CTAB (81 slots, entry = gen/type/obj/rights/badge/parent,
+18 trytes each) and an EPT (9 endpoints: used, rq_h, rq_t, sq_h, sq_t, caller). Cap refs
+are slot indices; gens are counted per slot on delete (full (slot,gen) refs arrive with
+M6 user CapSpaces). EP_CREATE (syscall 17) is the bootstrap creator: finds a free
+endpoint, allocates a cap with every right + and badge = argument.
+**Reason:** M5 threads are kernel threads (physical addressing), so one global table
+suffices and no user-visible cap format exists yet; the structure mirrors what per-task
+CapSpaces will embed from M6.
+
+## D-038 — 2026-11-22 — M5 IPC semantics: synchronous rendezvous, frame handoff
+**Choice:** SEND blocks when no receiver waits (receiver queue per endpoint); RECV
+dequeues a waiting sender or blocks; CALL = SEND + block-as-caller with the endpoint
+storing EE_CALLER for the later REPLY; NBSEND reports instead of blocking; REPLY with no
+caller errors. Messages: 2 words in R3/R4; cap in R2; status in R1, error detail in R2.
+Handoff = the kernel copies the sender's trap-frame msg slots into the receiver's frame
+and wakes it (direct handoff, no buffer). Fast path: the dequeued thread is woken via
+sched_enqueue, then schedule_switch picks it.
+**Reason:** rendezvous keeps the kernel free of message buffers (D-019 spirit), and the
+frame handoff avoids any copy area; CALL/REPLY rides the same queues with an extra
+caller slot.
+
+## D-039 — 2026-11-22 — Capability rights algebra: 9 x 2-trit groups, sticky deny
+**Choice:** the rights word packs 9 rights (READ..CONTROL, docs/04 order) as 2-trit
+balanced groups (-1 denied, 0 not held, +1 held). CAP_DERIVE(parent, req): child group =
+min(parent, requested) with numeric order - < 0 < +, so a denied parent group forces the
+child (sticky deny). CAP_COPY = derive with req = parent. CAP_REVOKE frees every slot
+whose parent chain passes the target (chain walk stops at freed slots); CAP_DELETE frees
+one slot (children keep working). Derive/copy/revoke require parent GRANT = +.
+**Reason:** the numeric order makes min() plain integer min; 2-trit groups fit 9 rights
+in one 18-trit word and extract via TSHR + balanced MOD 9. Revoke-as-chain-walk is
+O(slots) but allocation-free and matches the sticky-deny semantics.

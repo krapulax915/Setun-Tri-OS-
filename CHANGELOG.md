@@ -2,6 +2,17 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M5 — 2026-11-22 — IPC + capabilities (partial; ping-pong WIP)
+- `kernel/kernel.asm`: kernel-global CTAB (81 caps, 9 rights x 2-trit groups) + EPT
+  (9 endpoints with receiver/sender wait queues and a CALLER slot); syscalls EP_CREATE,
+  SEND, RECV, CALL, REPLY, NBSEND, CAP_DERIVE, CAP_COPY, CAP_REVOKE, CAP_DELETE with
+  frame-based argument passing (D-037..D-039).
+- Capability self-test green: derive chain, sticky deny (SEND=-1 survives a request of
+  +1), subtree revoke (grandchild delete fails), copy.
+- WIP: SEND/RECV ping-pong deadlocks (see BUG_M5_NOTES.md — a RETI restores a stale EPC
+  when the timer fires inside the handoff window); phases 6-7 parked, everything else
+  green. 102 tests.
+
 ## M4 — 2026-11-21 — Threads + scheduler (Triad kernel, D-033..D-036)
 - `tools/tvm/cpu.py`: PSW shadow (D-033) — trap entry snapshots mode/irq, RETI restores
   them, CSRW PSW updates the snapshot; the handler→RETI resume path is now zero-window.

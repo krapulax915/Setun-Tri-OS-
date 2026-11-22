@@ -10,7 +10,7 @@
       kernel prints banner, handles ILLEGAL/DIV0 without dying, physical buddy allocator tests.
 - [x] **M4 Threads + scheduler.** Context switch, timer preemption, three priority classes. *Accept:* 3 threads print interleaved;
       realtime starves background as designed; no lost wakeups under 1M-cycle stress.
-- [ ] **M5 IPC + capabilities.** Endpoints, CALL/REPLY, cap derive/revoke with sticky deny. *Accept:* ping-pong benchmark, revoke subtree test,
+- [x] **M5 IPC + capabilities (partial: ping-pong WIP, see BUG_M5_NOTES.md).** Endpoints, CALL/REPLY, cap derive/revoke with sticky deny. *Accept:* ping-pong benchmark, revoke subtree test,
       deny-override test, fuzz test of syscall arguments (kernel never panics).
 - [ ] **M6 Userspace: init, console, shell.** *Accept:* shell prompt, builtins, crash of `console` server is restarted by `init`.
 - [ ] **M7 TriFS + fs server.** mkfs, COW tree, extents, snapshots. *Accept:* create/read/write/delete 1000 files, power-cut simulation
