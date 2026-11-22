@@ -147,6 +147,7 @@ class CPU:
         self.halted = False
         self.waiting = False
         self.trap_hook = trap_hook            # used while TVEC == 0 (bare metal)
+        self.trace_hook = None                # optional: called on trap/RETI events
         self.irq_pending = set()              # cause numbers waiting for delivery
         self.time = 0
         self.cycle = 0
@@ -203,6 +204,10 @@ class CPU:
 
     # ---- trap entry (D-017) ---------------------------------------------------------
     def _trap(self, cause, tval, epc):
+        if self.trace_hook is not None:
+            self.trace_hook("trap", cause=cause, tval=tval, epc=epc, pc=self.pc,
+                            mode=self.mode, irq=self.irq_enable,
+                            r1=self.r[1], r8=self.r[8])
         if self.csr.get(CSR_TVEC, 0) == 0 and self.trap_hook is not None:
             self.trap_hook(cause, tval, epc)
             self.halted = True              # bare metal: unhandled trap halts
@@ -531,6 +536,11 @@ class CPU:
         elif op == _OPV["RETI"]:                       # RETI (privileged)
             if self.mode != 1:
                 raise Trap(C_PRIV, op)
+            if self.trace_hook is not None:
+                self.trace_hook("reti", epc=self.csr[CSR_EPC],
+                                shadow=self.psw_shadow, pc=pc,
+                                mode=self.mode, irq=self.irq_enable,
+                                r1=self.r[1], r8=self.r[8])
             self.pc = self.csr[CSR_EPC]
             m = T.wrap(self.psw_shadow, 1)             # mode/irq from PSW (D-033)
             self.mode = m

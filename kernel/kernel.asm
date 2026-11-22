@@ -468,6 +468,9 @@ cc_ok:
     ret
 
 ep_dequeue:                          ; R1 = &head, R2 = &tail -> R6 = tid (0 empty)
+    push R7                          ; the tcb_addr call below clobbers the LR;
+                                     ; without this, ret (JR R7) jumps back
+                                     ; INTO this function's middle (D-040 note)
     LDW R6, R1                       ; clobbers R3, R5; preserves R1, R2, R4
     CMPI3 R5, R6, 0
     BRZ R5, ed_out
@@ -485,6 +488,7 @@ ep_dequeue:                          ; R1 = &head, R2 = &tail -> R6 = tid (0 emp
 ed_z:
     STW R2, R0                       ; tail = 0 (queue drained)
 ed_out:
+    pop R7
     ret
 
 wait_push:                           ; R1 = &head, R2 = &tail, R3 = tid
@@ -2488,11 +2492,9 @@ m4_main:
     BRN R5, st_fail2                 ; detail: bad cap/rights
     const R1, str_caps_ok
     call puts
-    JMP m5_done2                     ; WIP M5+M6: phases 6-7 and the M6 console
-                                     ; phase are parked (ep_dequeue head-write
-                                     ; gets R1 = syscall num under preemption;
-                                     ; see BUG_M5_NOTES.md) — needs a fresh
-                                     ; debugging session
+    JMP p6_start                     ; phase 6 (SEND/RECV ping-pong) unparked;
+                                     ; phase 7 + the M6 console phase follow
+                                     ; once the handoff is proven stable
 
 m5_done:
     ; (M5 phases 6-7 — CALL/REPLY ping-pong + fuzz — are parked, see
@@ -2531,11 +2533,12 @@ m5_done:
     LDI R3, -1
     LDI R1, 8
     TRAP 0
-    ; the console is down: SEND must fail now
+    ; the console is down: NBSEND must fail now (a blocking SEND would park
+    ; init on the empty sender queue forever)
     const R3, XGRAND
     LDW R2, R3
     LDI R3, 67
-    LDI R1, 8
+    LDI R1, 12                       ; NBSEND
     TRAP 0
     CMPI3 R5, R1, 0
     BRZ R5, st_fail2                 ; must fail: the server crashed
@@ -2571,9 +2574,10 @@ m4_park:
     TRAP 0
     JMP m4_park
 
-    ; ---- phase 6 (parked): CALL/REPLY ping-pong on the master endpoint ----
+    ; ---- phase 6: SEND/RECV ping-pong on the master endpoint ----
     ; the cap lives in XC2 (reused: phase 5 is done) and is RE-READ every
     ; iteration — a register copy would have to survive timer preemptions
+p6_start:
     const R3, XCAP
     LDW R1, R3                       ; master cap
     const R3, XC2
@@ -2591,14 +2595,16 @@ m4_park:
     ADD R7, R1, R0                   ; t0
     LDI R5, 0                        ; i
 pp_loop:
-    ADD R3, R5, R0                   ; request = i
+    const R6, XC2                    ; R6 = &cap slot (stable across iterations:
+                                     ; R3 carries the request, R2 the cap)
+    LDW R2, R6                       ; cap re-read every iteration
+    ADD R3, R5, R0                   ; request = i (AFTER the cap load: const
+                                     ; would otherwise overwrite the request)
     LDI R4, 0
-    const R3, XC2
-    LDW R2, R3                       ; cap re-read every iteration
     LDI R1, 8                        ; SEND (blocks until the server RECVs)
     TRAP 0
+    LDW R2, R6                       ; cap for the RECV (R6 = &XC2 survives)
     LDI R1, 9                        ; RECV the reply
-    ADD R2, R6, R0
     TRAP 0                           ; R3 = reply = i + 1
     ADDI R2, R5, 1
     CMP3 R2, R3, R2
@@ -2619,22 +2625,25 @@ pp_loop:
     ; ---- phase 7: syscall argument fuzz (the kernel must survive) ----
     LDI R5, 0                        ; row index
 fz_loop:
-    MULI R2, R5, 12
-    const R3, FTAB
-    ADD R2, R3, R2
-    LDW R1, R2                       ; num
-    LEA R2, R2, 3
-    LDW R2, R2                       ; arg1
-    LEA R2, R2, 3
-    LDW R3, R2                       ; arg2
-    LEA R2, R2, 3
-    LDW R4, R2                       ; arg3
+    MULI R6, R5, 12
+    const R7, FTAB
+    ADD R6, R7, R6                   ; R6 = &row (R2 must stay free: it receives
+                                     ; arg1 — reusing R2 as the pointer made the
+                                     ; next LEA load from the arg VALUE)
+    LDW R1, R6                       ; num
+    LEA R6, R6, 3
+    LDW R2, R6                       ; arg1
+    LEA R6, R6, 3
+    LDW R3, R6                       ; arg2
+    LEA R6, R6, 3
+    LDW R4, R6                       ; arg3
     TRAP 0
     ADDI R5, R5, 1
     CMPI3 R2, R5, FZROWS
     BRN R2, fz_loop
     const R1, str_fuzz_ok
     call puts
+    JMP m5_done                      ; the M6 console phase follows
 
 wait1:                               ; R3 = &slot word holding the WDONE index:
                                      ; spin until WDONE[index] == 1

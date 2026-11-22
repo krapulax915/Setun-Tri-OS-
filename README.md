@@ -35,7 +35,7 @@ Core numbers / Alapadatok:
 | Page / oldal | 729 trytes / tryte |
 | ISA | 49 opcodes, 4-trit op field, `[op:4\|rd:2\|rs:2\|imm:10]` |
 | Compare / összehasonlítás | three-way, no flags / háromutas, nincs flag-regiszter |
-| Tests / tesztek | 102 green / zöld |
+| Tests / tesztek | 107 green / zöld |
 
 ## Status / Állapot
 
@@ -53,9 +53,9 @@ tesztkészlettel. A jelenlegi állapot:
 | M1 | TriASM assembler (macros, expressions), TVM CPU core (49 opcodes, traps), disassembler round-trip, TXE/pack codec | ✅ |
 | M2 | MMIO devices (UART/block/RNG/power), boot ROM + TXE loading from disk, linker, raw disk images, debugger | ✅ |
 | M3 | MMU (3-level ternary page tables, TLB), trap vector, ternary buddy allocator, Triad kernel boots to banner + self-test | ✅ |
-| M4 | Threads + scheduler (3 priority classes, timer preemption) | 🚧 planned / tervezett |
-| M5 | IPC + capability system (sticky deny, subtree revoke) | 🚧 planned / tervezett |
-| M6 | Userspace: init, console, shell + server restart | 🚧 planned / tervezett |
+| M4 | Threads + scheduler (3 priority classes, timer preemption) | ✅ |
+| M5 | IPC + capability system (sticky deny, subtree revoke), 200-call ping-pong, syscall fuzz | ✅ |
+| M6 | Userspace: init, console, shell + server restart (console echo/panic/restart green) | 🚧 in progress / folyamatban |
 | M7 | TriFS filesystem + fs server (COW, snapshots, checksums, power-cut test) | 🚧 planned / tervezett |
 | M8 | TXE loader + coreutils + pipes | 🚧 planned / tervezett |
 | M9 | Profiler + `rle3`/`huff3` compression | 🚧 planned / tervezett |

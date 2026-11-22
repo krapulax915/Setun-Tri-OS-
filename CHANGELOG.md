@@ -2,6 +2,22 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M5+M6 — 2026-11-22 — IPC handoff fixed; capabilities, ping-pong, fuzz, console all green
+- `kernel/kernel.asm`: the parked M5/M6 handoff bug is closed — root cause was an R7
+  (link-register) clobber in `ep_dequeue` (`call tcb_addr` overwrote the LR that the
+  closing `JR R7` needed, so the function returned into its own middle); fixed with
+  push/pop R7 on all paths (D-040). Phase-6 loop register reuse (request vs cap) and
+  the phase-7 fuzz pointer clobber fixed; the console-down probe now uses NBSEND.
+- Phase 6 unparked: SEND/RECV ping-pong, 200 round-trips ("ipc: 200 calls / <ticks>").
+- Phase 7 unparked: syscall-argument fuzz survives with zero kernel exceptions printed
+  (bad tids/caps/ops all return errors cleanly).
+- M6 console phase unparked: console server echoes 'A'/'B', exits on the panic request
+  (-1), NBSEND afterwards fails, init restarts it on the same endpoint and gets 'R'.
+- `tools/tvm/cpu.py`: optional trace_hook on trap entry and RETI (debug/audit facility).
+- `BUG_M5_NOTES.md`: root cause + single-step proof recorded; bug closed.
+- Tests: 107 green (test_m5.py adds 5: caps, ping-pong, fuzz purity, console
+  echo/panic/restart, clean power-off). DECISIONS: D-040.
+
 ## M5 — 2026-11-22 — IPC + capabilities (partial; ping-pong WIP)
 - `kernel/kernel.asm`: kernel-global CTAB (81 caps, 9 rights x 2-trit groups) + EPT
   (9 endpoints with receiver/sender wait queues and a CALLER slot); syscalls EP_CREATE,

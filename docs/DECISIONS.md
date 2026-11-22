@@ -436,3 +436,14 @@ one slot (children keep working). Derive/copy/revoke require parent GRANT = +.
 **Reason:** the numeric order makes min() plain integer min; 2-trit groups fit 9 rights
 in one 18-trit word and extract via TSHR + balanced MOD 9. Revoke-as-chain-walk is
 O(slots) but allocation-free and matches the sticky-deny semantics.
+
+## D-040 — 2026-11-22 — Link-register convention: `call` clobbers R7, `ret` must restore it
+**Choice:** `call lbl` = JAL sets R7 = return address; `ret` = JR R7. Any function that
+executes `call` and returns via `ret` MUST preserve the link: either `push R7`/`pop R7`
+around the body (ep_dequeue, wait_push) or park it in a callee-saved register
+(sched_bootstrap keeps it in R6 across stack switches). Audit rule: a `call` reachable
+`ret` without a saved LR jumps back into the function's own middle — this was the M5
+handoff bug (ep_dequeue → tcb_addr), misdiagnosed for weeks as a nested-trap/RETI race.
+**Reason:** R7 is the only LR and the trap handler overwrites it freely, so the
+convention must be explicit and auditable; the single-step proof (frozen machine,
+instruction log) settled the diagnosis in one run.
