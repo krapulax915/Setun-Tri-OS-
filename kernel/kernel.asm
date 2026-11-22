@@ -2476,11 +2476,15 @@ m4_main:
     call puts
 
     ; ---- phase 6: CALL/REPLY ping-pong on the master endpoint ----
+    ; the cap lives in XC2 (reused: phase 5 is done) and is RE-READ every
+    ; iteration — a register copy would have to survive timer preemptions
     const R3, XCAP
-    LDW R6, R3                       ; master cap
+    LDW R1, R3                       ; master cap
+    const R3, XC2
+    STW R3, R1
     const R2, wr_server
     LDI R3, 0                        ; normal class
-    ADD R4, R6, R0                   ; arg = the cap
+    LDW R4, R3                       ; arg = the cap
     LDI R1, 3                        ; THREAD_CREATE
     TRAP 0
     LDI R1, 5                        ; TIME
@@ -2490,7 +2494,8 @@ m4_main:
 pp_loop:
     ADD R3, R5, R0                   ; request = i
     LDI R4, 0
-    ADD R2, R6, R0                   ; cap
+    const R3, XC2
+    LDW R2, R3                       ; cap re-read every iteration
     LDI R1, 10                       ; CALL
     TRAP 0                           ; R1 = 0 ok, R3 = reply = i + 1
     ADDI R2, R5, 1
