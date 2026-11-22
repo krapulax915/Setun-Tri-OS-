@@ -715,6 +715,8 @@ sys_call:                            ; frame: cap +18, msg +15/+12; right CALL
     ADD R1, R6, R0
     call tcb_addr
     call ipc_deliver                 ; msg -> server frame
+    ADD R1, R6, R0
+    call sched_enqueue               ; wake the server (same as sys_send!)
     LEA R3, R4, EE_CALLER
     const R2, CURRENT
     LDW R2, R2
