@@ -21,3 +21,24 @@ frame-build point (it is set once at entry, before push R3/push R7).
 After validation, reload arg from R4-3 (push R3 slot) — or simplest: keep
 arg in a callee-saved slot instead of the caller stack, e.g. reuse T_PEND
 of the new TCB (written before enqueue, read during frame build).
+
+## Update (fresh measurement)
+- Caller passes arg correctly: phase-6 stores master cap (=0) into XC2, create
+  arg = 0. So the synthetic frame R1 slot SHOULD be 0 (slot 0 = master cap).
+- Server's first RECV trap reads interrupted R2 = 132094791 (garbage) — so the
+  server's R2 register was already garbage at its first TRAP, i.e. the restore
+  delivered a bad R2, or the frame's R2 slot holds garbage.
+- Frame layout on server stack (T_SP=1207200): arg pushed at top-3=1207221,
+  six zero pushes 1207218..1207203, saved_sp at 1207200. Restore pops R7..R1
+  from T_SP+3..T_SP+21 = 1207203..1207221. R2 slot = T_SP+18 = 1207218 = zero
+  push. Measured R2 = 132094791 != 0 => either the zero-pushes didn't land
+  (stack base mismatch) or something overwrote 1207218 afterwards.
+- 132094791 also appeared in the M3 debug as a garbage node id: it may be the
+  content of freshly buddy_alloc'd stack memory (uninitialized) — i.e. the
+  arg/zero pushes landed at a DIFFERENT address than the frame the restore
+  reads. Prime suspect: stack_top computed as base+729 vs T_SP written as
+  frame top; check ADD R8,R2,R0 ordering: R2=base+729=top, R8=top; pushes
+  from top-3 down to top-24; T_SP=frame top=top-24; restore reads T_SP+3..21
+  = top-21..top-3 = the arg+zero region. Addresses check out arithmetically.
+  => next: single-step the FIRST create-body frame build and dump the new
+  stack region after the build, before the enqueue.
