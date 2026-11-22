@@ -19,6 +19,8 @@
 
     .equ MMIO,      128608722
     .equ UART_TX,   MMIO+0
+    .equ UART_RX,   MMIO+3
+    .equ UART_STAT, MMIO+6
     .equ POWER,     MMIO+27
     .equ KERNEL_LOAD, 7290
     .equ STRBASE,   30000
@@ -94,6 +96,9 @@
     .equ NEP,       9                   ; endpoint objects
     .equ EPT,       CTAB + 1458         ; NEP x 18 trytes: used, rq_h, rq_t,
                                         ; sq_h, sq_t, caller
+    .equ LLEN,      EPT + 162           ; shell: line length in trytes
+    .equ LBUF,      EPT + 165           ; shell: line buffer, 24 trytes (8 chars;
+                                        ; ends inside reserved frame 1414)
     .equ EE_RQH,    3                   ; receiver-waiting queue head/tail
     .equ EE_RQT,    6
     .equ EE_SQH,    9                   ; sender-waiting queue head/tail
@@ -324,6 +329,8 @@ th_sys:
     BRZ R5, sys_cap_delete
     CMPI3 R5, R1, 17
     BRZ R5, sys_ep_create
+    CMPI3 R5, R1, 18
+    BRZ R5, sys_getchar
     const R1, str_badcall
     call puts
     JMP th_resume
@@ -860,6 +867,21 @@ ec_found:
     LEA R3, R8, 18
     STW R3, R1                       ; error R2 = 0
     JMP th_resume
+
+sys_getchar:                         ; num 18: -> R1 = char tryte, 0 = none.
+                                     ; Yield-poll: an empty UART re-queues the
+                                     ; caller so the shell is scheduler-fair.
+    const R2, UART_STAT
+    LDT R3, R2                       ; tryte: nonzero = input pending
+    BRZ R3, sg_yield
+    const R2, UART_RX
+    LDT R3, R2                       ; char tryte (TriText page value)
+    LEA R5, R8, 21
+    STW R5, R3                       ; result R1 = char
+    JMP th_resume
+sg_yield:
+    call sched_requeue_cur
+    call schedule_switch             ; never returns
 
 sys_cap_derive:                      ; frame: parent +18, requested rights +15
     LEA R1, R8, 18
@@ -2260,6 +2282,167 @@ srv_loop:
     JMP srv_loop
 
 ; ------------------------------------------------------------------------------
+; shell_main — M6 interactive shell (a normal user thread). Prints a prompt,
+; reads a line through GETCHAR (yield-poll inside the syscall), then runs the
+; builtins: help | ver | echo <text> | crash | halt.
+; echo routes the text through the console server via SEND (the IPC demo);
+; crash NBSENDs the panic request and restarts the console server on the same
+; endpoint; halt powers the machine off.
+; ------------------------------------------------------------------------------
+shell_main:
+    const R1, str_shello
+    call puts
+sh_loop:
+    const R1, str_prompt
+    call puts
+    LDI R1, 0
+    const R2, LLEN
+    STW R2, R1                       ; LLEN = 0
+sh_read:
+    LDI R1, 18                       ; GETCHAR (yield-poll when idle)
+    TRAP 0                           ; R1 = char tryte
+    BRZ R1, sh_read                  ; nothing typed yet
+    ADD R3, R1, R0
+    call putc                        ; echo the keystroke
+    CMPI3 R5, R1, 10                 ; newline ends the line
+    BRZ R5, sh_exec
+    const R2, LLEN
+    LDW R3, R2                       ; len
+    CMPI3 R5, R3, 24
+    BRZP R5, sh_read                 ; buffer full: swallow the tail
+    const R4, LBUF
+    ADD R4, R4, R3                   ; &LBUF[len] (tryte addressing)
+    STT R4, R1                       ; store the char tryte
+    ADDI R3, R3, 1
+    STW R2, R3                       ; len += 1
+    JMP sh_read
+sh_exec:
+    const R2, LLEN
+    LDW R3, R2
+    const R4, LBUF
+    ADD R4, R4, R3
+    LDI R6, 0
+    STT R4, R6                       ; NUL-terminate (an empty line must not
+                                     ; match against a stale previous line)
+    const R1, LBUF
+    const R2, str_cmd_help
+    call str_eq
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_help
+    const R1, LBUF
+    const R2, str_cmd_ver
+    call str_eq
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_ver
+    const R1, LBUF
+    const R2, str_cmd_crash
+    call str_eq
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_crash
+    const R1, LBUF
+    const R2, str_cmd_halt
+    call str_eq
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_halt
+    ; "echo " prefix? (5 trytes must match exactly)
+    const R1, LBUF
+    const R2, str_cmd_echo
+    LDI R5, 0                        ; i
+shp_loop:
+    ADD R3, R1, R5
+    LDT R4, R3                       ; line[i]
+    ADD R3, R2, R5
+    LDT R6, R3                       ; cmd[i]
+    CMP3 R6, R4, R6                  ; R6 = sign(line[i] - cmd[i])
+    BRNZ R6, sh_unknown
+    ADDI R5, R5, 1
+    CMPI3 R6, R5, 5                  ; 5 chars (tryte addressing: +1 per char)
+    BRN R6, shp_loop
+sh_echo:
+    LDI R5, 5                        ; i = tryte 5 (after "echo ")
+    const R2, LLEN
+    LDW R4, R2                       ; len (trytes)
+    const R2, XGRAND
+    LDW R2, R2                       ; console cap
+sh_echo2:
+    CMP3 R6, R5, R4                  ; i >= len -> done
+    BRZP R6, sh_echo_nl
+    const R3, LBUF
+    ADD R3, R3, R5
+    LDT R6, R3                       ; char
+    ADD R3, R6, R0                   ; msg1 = char
+    const R2, XGRAND
+    LDW R2, R2                       ; cap re-read EVERY iteration: a completed
+                                     ; SEND zeroes R1/R2 in the returned frame
+                                     ; (ipc_ok), so R2 must be reloaded
+    LDI R1, 8                        ; SEND
+    TRAP 0
+    ADDI R5, R5, 1
+    JMP sh_echo2
+sh_echo_nl:
+    const R2, XGRAND
+    LDW R2, R2
+    LDI R3, 10                       ; newline
+    LDI R1, 8                        ; SEND
+    TRAP 0
+    JMP sh_loop
+sh_unknown:
+    const R1, str_unknown
+    call puts
+    JMP sh_loop
+sh_help:
+    const R1, str_help
+    call puts
+    JMP sh_loop
+sh_ver:
+    const R1, str_ver
+    call puts
+    JMP sh_loop
+sh_crash:
+    const R2, XGRAND
+    LDW R2, R2
+    LDI R3, -1                       ; panic request
+    LDI R1, 12                       ; NBSEND: the server takes it and exits
+    TRAP 0
+    ; restart the console server on the same endpoint (supervisor behaviour)
+    const R2, wr_consv
+    const R4, XGRAND
+    LDW R4, R4                       ; arg = console cap
+    LDI R3, 0                        ; class = normal (loaded LAST)
+    LDI R1, 3
+    TRAP 0                           ; THREAD_CREATE
+    LDI R1, 1
+    TRAP 0                           ; YIELD: let the new server RECV-block
+    const R1, str_conrestart
+    call puts
+    JMP sh_loop
+sh_halt:
+    const R1, POWER
+    LDI R2, 1
+    STW R1, R2                       ; power off
+    JMP sh_loop
+
+str_eq:                              ; R1 = &a, R2 = &b (tryte strings, NUL
+    push R7                          ; terminated) -> R3 = 1 if equal
+se_loop:
+    LDT R4, R1
+    LDT R5, R2
+    CMP3 R6, R4, R5
+    BRNZ R6, se_diff
+    BRZ R4, se_same                  ; both NUL: equal
+    ADDI R1, R1, 1
+    ADDI R2, R2, 1
+    JMP se_loop
+se_same:
+    LDI R3, 1
+    JMP se_out
+se_diff:
+    LDI R3, 0
+se_out:
+    pop R7
+    ret
+
+; ------------------------------------------------------------------------------
 ; m4_main — the main thread (tid 1): scheduler self-test
 ; ------------------------------------------------------------------------------
 m4_main:
@@ -2563,9 +2746,24 @@ m5_done:
     const R1, str_restart
     call puts
 
-m5_done2:
+m5_done2:                            ; init: ready. Console input waiting ->
+                                     ; hand the system to the shell; headless
+                                     ; boot -> clean power-off.
     const R1, str_ready
     call puts
+    const R2, UART_STAT
+    LDT R3, R2                       ; nonzero = input pending
+    BRZ R3, m6_off
+    const R2, shell_main
+    LDI R3, 0                        ; class = normal
+    LDI R4, 0                        ; arg
+    LDI R1, 3                        ; THREAD_CREATE(shell)
+    TRAP 0
+m6_park:
+    LDI R1, 1                        ; YIELD forever: the shell runs the system
+    TRAP 0
+    JMP m6_park
+m6_off:
     const R1, POWER
     LDI R2, 1
     STW R1, R2                       ; clean power-off
@@ -2692,6 +2890,17 @@ str_ipc:         .asciz "ipc: 200 calls / "
 str_fuzz_ok:     .asciz "fuzz: ok\n"
 str_condown:     .asciz "init: console down\n"
 str_restart:     .asciz "init: console restarted\n"
+str_shello:      .asciz "\nSetun shell (type help)\n"
+str_prompt:      .asciz "$ "
+str_help:        .asciz "builtins: help ver echo <text> crash halt\n"
+str_ver:         .asciz "Setun Tri OS v0.1 (ternary)\n"
+str_cmd_help:    .asciz "help"
+str_cmd_ver:     .asciz "ver"
+str_cmd_crash:   .asciz "crash"
+str_cmd_halt:    .asciz "halt"
+str_cmd_echo:    .asciz "echo "
+str_unknown:     .asciz "unknown command\n"
+str_conrestart:  .asciz "console restarted\n"
 str_test_fail:   .asciz "self-test: FAIL\n"
 .equ FZROWS,     16
 

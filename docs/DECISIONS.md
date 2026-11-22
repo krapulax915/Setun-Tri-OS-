@@ -447,3 +447,13 @@ handoff bug (ep_dequeue → tcb_addr), misdiagnosed for weeks as a nested-trap/R
 **Reason:** R7 is the only LR and the trap handler overwrites it freely, so the
 convention must be explicit and auditable; the single-step proof (frozen machine,
 instruction log) settled the diagnosis in one run.
+
+## D-041 — 2026-11-22 — IPC return signature: R1/R2 are not preserved across a syscall
+**Choice:** SEND/RECV/CALL/REPLY/NBSEND and every syscall write the result/error into
+the trap frame's R1 (status, +21) and R2 (err, +18) slots; ipc_ok/ipc_err* zero them.
+Therefore loop state carried in R1/R2 does NOT survive a syscall — keep it in memory or
+reload it after each call (the shell re-reads the console cap before every SEND; the
+M5 ping-pong re-reads the cap slot every iteration for the same reason).
+**Reason:** the frame is the syscall ABI; overwriting two fixed slots keeps the
+kernel push-free in the handoff (no R8-slide hazard) and makes the caller-visible
+contract explicit and auditable.

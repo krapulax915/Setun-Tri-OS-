@@ -2,6 +2,25 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M6 — 2026-11-22 — Interactive shell over the console server (D-041)
+- `kernel/kernel.asm`: GETCHAR syscall (num 18): reads one TriText tryte from the
+  UART, yield-polls via sched_requeue_cur when the input is empty, so the shell
+  stays scheduler-fair. `shell_main` thread: prints a prompt, reads a line into a
+  tryte buffer (LBUF/LLEN at EPT+162, inside the reserved frames), NUL-terminates
+  it, and dispatches the builtins help | ver | echo <text> | crash | halt.
+  `echo` routes the text through the console server char-by-char via SEND (the
+  IPC demo); `crash` NBSENDs the panic request and restarts the server on the
+  same endpoint; `halt` powers off.
+- init (m4_main) hands the system to the shell only when console input is
+  waiting at ready-time (UART_STAT probe); headless boots keep the
+  banner-...-ready-power-off flow, so every existing test stays deterministic.
+- D-041: a completed SEND/RECV/CALL/REPLY overwrites R1 (status) and R2 (err) in
+  the returned frame — loop state must live in memory or be reloaded per call
+  (the shell re-reads the console cap before every SEND).
+- `tests/test_m6.py`: 5 tests — headless boot has no shell, prompt + help/ver,
+  echo via console IPC, unknown command, crash-restart-then-echo.
+- Tests: 112 green.
+
 ## M5+M6 — 2026-11-22 — IPC handoff fixed; capabilities, ping-pong, fuzz, console all green
 - `kernel/kernel.asm`: the parked M5/M6 handoff bug is closed — root cause was an R7
   (link-register) clobber in `ep_dequeue` (`call tcb_addr` overwrote the LR that the
