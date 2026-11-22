@@ -2488,8 +2488,13 @@ m4_main:
     BRN R5, st_fail2                 ; detail: bad cap/rights
     const R1, str_caps_ok
     call puts
+    JMP m5_done2                     ; WIP M5+M6: phases 6-7 and the M6 console
+                                     ; phase are parked (ep_dequeue head-write
+                                     ; gets R1 = syscall num under preemption;
+                                     ; see BUG_M5_NOTES.md) — needs a fresh
+                                     ; debugging session
 
-    ; ---- M6: console server + crash + init restart (D-040) ----
+m5_done:
     ; (M5 phases 6-7 — CALL/REPLY ping-pong + fuzz — are parked, see
     ;  BUG_M5_NOTES.md: the handshake deadlock needs a fresh session)
     LDI R1, 17                       ; EP_CREATE console endpoint
@@ -2500,10 +2505,10 @@ m4_main:
     const R3, XGRAND
     STW R3, R1                       ; XGRAND slot reused as the console cap
     const R2, wr_consv
-    LDI R3, 0
-    LDW R4, R3
     const R3, XGRAND
     LDW R4, R3                       ; arg = console cap
+    LDI R3, 0                        ; class = normal (loaded LAST: the const
+                                     ; above would clobber R3)
     LDI R1, 3
     TRAP 0                           ; create the console server
     LDI R1, 1                        ; YIELD: let it RECV-block
@@ -2538,9 +2543,9 @@ m4_main:
     call puts
     ; init restarts the console server on the SAME endpoint (the cap survives)
     const R2, wr_consv
-    LDI R3, 0
     const R3, XGRAND
-    LDW R4, R3
+    LDW R4, R3                       ; arg = console cap
+    LDI R3, 0                        ; class = normal (loaded LAST)
     LDI R1, 3
     TRAP 0
     CMPI3 R5, R1, 0
@@ -2555,7 +2560,7 @@ m4_main:
     const R1, str_restart
     call puts
 
-m5_done:
+m5_done2:
     const R1, str_ready
     call puts
     const R1, POWER
