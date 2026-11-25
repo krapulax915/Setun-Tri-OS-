@@ -34,13 +34,37 @@
     .equ KSAVE,      KDATA+9842+27      ; 11 words
     .equ PNUMBUF,    KSAVE+33           ; 12 trytes
     .equ NODES,      PNUMBUF+12         ; 6132 words (self-test array)
-    .equ RES_END,    1415               ; frames [0, 1415) reserved: static data
+    .equ RES_END,    1417               ; frames [0, 1417) reserved: static data
                                         ; (TCBs, queues, idle stack, M4T, CTAB, EPT)
-                                        ; ends at 1031085, inside frame 1414
+                                        ; ends at 1031436, inside frame 1414;
+                                        ; frame 1415 is the fs free-list buffer,
+                                        ; frame 1416 the fs block buffer (TriFS).
+                                        ; D-043: BOTH fs frames must sit below
+                                        ; RES_END or thread stacks corrupt them
+    .equ BB2,       1415 * 729          ; 729-tryte free-list IO buffer (keeps
+                                        ; BBUF intact while dir_upd stages a clone)
+    .equ BBUF,      1416 * 729          ; 729-tryte block buffer (TriFS)
+    .equ FS_BASE,   28                  ; TriFS superblock block (D-042)
+    .equ SB_FREE,   9                   ; superblock word offsets: free head
+    .equ SB_ROOT,   12                  ; COW dir-chain root
+    .equ SB_GEN,    15                  ; snapshot generation
+    .equ SB_SUM,    18                  ; superblock checksum word
+    .equ DIR_REFS,  241                 ; refs per dir block (6+241*3 = 729)
+    .equ DIR_LEVELS, 5                  ; fixed dir-chain depth: 5*241 = 1205
+                                        ; slots >= the 1000-file workload, so
+                                        ; per-block counts never change and a
+                                        ; mid-workload crash still exposes a
+                                        ; full 1000-slot ref vector (host fsck)
+    .equ FS_MAGIC,  123456789           ; superblock magic
+    .equ FS_NB,     2200                ; fs-region block count (incl. super)
+    .equ BLK_LBA,   MMIO+12
+    .equ BLK_BUF,   MMIO+15
+    .equ BLK_CMD,   MMIO+18
+    .equ BLK_STAT,  MMIO+21
     .equ STK_LO,     6446
     .equ STK_HI,     6448
     .equ KSTACK,     4700001
-    .equ FREE_FRAMES, 5143              ; 6561 - 1415(reserved) - 3(stack)
+    .equ FREE_FRAMES, 5141              ; 6561 - 1417(reserved) - 3(stack)
     .equ FREE_TEST,   240               ; boot self-test allocation count
 
 ; ---- scheduler constants (D-033/D-034) ---------------------------------------
@@ -99,6 +123,12 @@
     .equ LLEN,      EPT + 162           ; shell: line length in trytes
     .equ LBUF,      EPT + 165           ; shell: line buffer, 24 trytes (8 chars;
                                         ; ends inside reserved frame 1414)
+    .equ FS_OKFLAG, EPT + 189           ; 0 = fs usable, 1 = device too small
+    .equ XFS,       EPT + 192           ; fs endpoint cap (word-aligned!)
+    .equ FS_CAP,    EPT + 195           ; fs server's own cap, parked in MEMORY
+                                        ; (D-041): R6 is scratch for the format
+                                        ; loop and every op handler, so the cap
+                                        ; is re-read from here before each IPC
     .equ EE_RQH,    3                   ; receiver-waiting queue head/tail
     .equ EE_RQT,    6
     .equ EE_SQH,    9                   ; sender-waiting queue head/tail
@@ -277,7 +307,11 @@ th_nosave:
     BRN R5, th_exc
     CMPI3 R5, R1, 9
     BRN R5, th_timer                 ; TIMER cause = 1
-    ; device IRQ: print and resume the interrupted thread
+    ; device IRQ: the block device (12) completes synchronously, so resume
+    ; silently; any other device prints a diagnostic and resumes
+    CSRR R1, CAUSE
+    CMPI3 R5, R1, 12
+    BRZ R5, th_resume
     const R1, str_irq
     call puts
     CSRR R1, CAUSE
@@ -756,6 +790,14 @@ sys_call_blk:
     LDI R2, 2
     LEA R3, R1, 27
     STW R3, R2                       ; role = call sender
+    LEA R3, R4, EE_CALLER
+    const R2, CURRENT
+    LDW R2, R2
+    STW R3, R2                       ; endpoint caller = me: the server's
+                                     ; REPLY must find the blocked caller
+                                     ; (this write was missing and deadlocked
+                                     ; every blocked CALL — the "CALL/REPLY
+                                     ; deeper bug")
     LEA R1, R4, EE_SQH
     LEA R2, R4, EE_SQT
     const R3, CURRENT
@@ -2443,6 +2485,822 @@ se_out:
     ret
 
 ; ------------------------------------------------------------------------------
+; TriFS v0.1 server (D-042) — index-keyed COW tree over the block device.
+; All helpers below are called from the fs server thread (user mode, own
+; kernel stack); they route block IO through the MMIO block device into the
+; static 729-tryte buffer BBUF (reserved frame 1416, D-043) or BB2 (frame
+; 1415, free-list IO only).
+;   blk_read(lba)  / blk_write(lba)   leaf: R1 = lba, data in/out of BBUF
+;   free_alloc()                      -> R1 = lba or -1 (clobbers R2..R5)
+;   free_free(lba)                    head-push (clobbers R2..R5, keeps R4..R6)
+;   sum_calc(addr)                    -> R1 = balanced sum (clobbers R2..R5)
+;   data_fill(i)                      BBUF = deterministic payload for file i
+;   dir_upd(i, val)                   COW-update slot i -> new root in R3
+; Conventions (D-040): every helper that calls others saves R7; R6+ preserved
+; unless stated; BBUF reads/writes use tryte addressing, words +3.
+; ------------------------------------------------------------------------------
+blk_read:                            ; R1 = lba -> BBUF (clobbers R2, R3)
+    const R2, BLK_LBA
+    STW R2, R1
+    const R2, BBUF
+    const R3, BLK_BUF
+    STW R3, R2                       ; buffer address = BBUF
+    const R2, BLK_CMD
+    LDI R3, 1
+    STW R2, R3                       ; cmd = read
+    ret
+blk_write:                           ; R1 = lba <- BBUF (clobbers R2, R3)
+    const R2, BLK_LBA
+    STW R2, R1
+    const R2, BBUF
+    const R3, BLK_BUF
+    STW R3, R2
+    const R2, BLK_CMD
+    LDI R3, 2
+    STW R2, R3                       ; cmd = write
+    ret
+
+blk_read2:                           ; R1 = lba -> BB2 (clobbers R2, R3). The
+    const R2, BLK_LBA                ; free-list helpers use this buffer so
+    STW R2, R1                       ; BBUF stays intact: dir_upd stages its
+    const R2, BB2                    ; clone there across a free_alloc call
+    const R3, BLK_BUF                ; (D-043).
+    STW R3, R2
+    const R2, BLK_CMD
+    LDI R3, 1
+    STW R2, R3                       ; cmd = read
+    ret
+blk_write2:                          ; R1 = lba <- BB2 (clobbers R2, R3)
+    const R2, BLK_LBA
+    STW R2, R1
+    const R2, BB2
+    const R3, BLK_BUF
+    STW R3, R2
+    const R2, BLK_CMD
+    LDI R3, 2
+    STW R2, R3                       ; cmd = write
+    ret
+
+free_alloc:                          ; -> R1 = lba or -1 (clobbers R2..R5; IO on
+    push R7                          ; BB2, so BBUF — dir_upd's staged clone —
+    push R2                          ; survives; preserves R6)
+    push R3
+    push R4
+    push R5
+    LDI R1, FS_BASE
+    call blk_read2                   ; superblock -> BB2
+    const R4, BB2 + SB_FREE
+    LDW R4, R4                       ; free head
+    CMPI3 R5, R4, 0
+    BRZ R5, fa_none
+    ADD R5, R4, R0                   ; head lba
+    ADD R1, R5, R0
+    call blk_read2                   ; the free block itself -> BB2
+    const R4, BB2
+    LDW R4, R4                       ; next = first word. R4 (not R2!): the
+                                     ; blk_read2 below clobbers R2/R3 — an R2
+                                     ; copy here stored BLK_CMD (the MMIO
+                                     ; address constant) as the free head and
+                                     ; wrecked the list from the first alloc
+    LDI R1, FS_BASE
+    call blk_read2                   ; superblock again -> BB2
+    const R3, BB2 + SB_FREE
+    STW R3, R4                       ; free_head = next
+    const R1, BB2
+    call super_sum                   ; refresh the super checksum (clobbers
+                                     ; R1..R3 only; R4/R5 survive)
+    LDI R1, FS_BASE
+    call blk_write2
+    ADD R1, R5, R0                   ; R1 = allocated lba
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+fa_none:
+    LDI R1, -1
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+
+free_free:                           ; R1 = lba -> free list head (clobbers R2,
+    push R7                          ; R3; preserves R4..R6); IO on BB2
+    push R2
+    push R3
+    push R4
+    push R5
+    ADD R4, R1, R0                   ; lba (blk_* keep R4)
+    LDI R1, FS_BASE
+    call blk_read2                   ; superblock -> BB2
+    const R2, BB2 + SB_FREE
+    LDW R5, R2                       ; old head. R5, NOT R3 — the blk_read2
+                                     ; below leaves R3 = 1 (the read cmd), so
+                                     ; an R3 copy here chained freed blocks to
+                                     ; word0=1 and poisoned the whole list
+    ADD R1, R4, R0
+    call blk_read2                   ; the block becoming free -> BB2
+    const R2, BB2
+    STW R2, R5                       ; its first word = old head
+    ADD R1, R4, R0
+    call blk_write2
+    LDI R1, FS_BASE
+    call blk_read2                   ; superblock -> BB2 (the read above
+    const R2, BB2 + SB_FREE          ; clobbered its word 0: re-read)
+    STW R2, R4                       ; free_head = lba
+    const R1, BB2
+    call super_sum                   ; refresh the super checksum (R4 survives)
+    LDI R1, FS_BASE
+    call blk_write2
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+
+sum_calc:                            ; R1 = base addr -> R1 = sum (clobbers R2..R5)
+    push R7
+    push R2
+    push R3
+    push R4
+    LDI R2, 0                        ; acc
+    LDI R3, 0                        ; j
+sc_loop:
+    ADD R4, R1, R3
+    LDT R4, R4                       ; tryte
+    ADD R2, R2, R4
+    ADDI R3, R3, 1
+    CMPI3 R5, R3, 729
+    BRN R5, sc_loop
+    ADD R1, R2, R0
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+
+data_fill:                           ; R1 = file index i (clobbers R2..R5; keeps R6)
+    push R7
+    push R2
+    push R3
+    push R4
+    MULI R2, R1, 729                 ; base = i*729: payload tryte j is
+                                     ; wrap(base + j, 6) — distinct per file
+                                     ; and position-dependent (corruption
+                                     ; changes the checksum)
+    LDI R3, 0
+df_loop:
+    ADD R4, R2, R3
+    const R5, BBUF
+    ADD R5, R5, R3
+    STT R5, R4                       ; mem[BBUF+j] = wrap(base+j, 6)
+    ADDI R3, R3, 1
+    CMPI3 R5, R3, 729
+    BRN R5, df_loop
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+
+dir_upd:                             ; R1 = slot i, R2 = value -> updates slot
+                                     ; i in the COW directory, swaps the root
+                                     ; atomically (ROOT+GEN+sum in one block
+                                     ; write), reclaims the old chain.
+                                     ; The chain is ALWAYS DIR_LEVELS blocks:
+                                     ; the first commit builds all five levels,
+                                     ; every later commit clones all five and
+                                     ; frees the old five — net cost 2 blocks
+                                     ; per file, and the old chain shares
+                                     ; nothing with the new one (safe to free
+                                     ; wholesale after the swap). Per-block
+                                     ; counts are fixed (241, top level 36),
+                                     ; matching the host-side chain reader.
+                                     ; Stack layout (SP grows downward, last
+                                     ; push at [R8]):
+                                     ;   [R8+0]  old level-4 lba
+                                     ;   [R8+3]  old level-3 lba
+                                     ;   [R8+6]  old level-2 lba
+                                     ;   [R8+9]  old level-1 lba
+                                     ;   [R8+12] old level-0 lba (old root)
+                                     ;   [R8+15] slot level k
+                                     ;   [R8+18] slot index i
+                                     ;   [R8+21] value
+    push R7
+    push R3
+    push R4
+    push R5
+    push R6
+    ADD R4, R1, R0                   ; i (blk_* keep R4)
+    push R2                          ; value
+    push R1                          ; slot index i
+    LDI R1, 0                        ; k = level of slot i: smallest k with
+du_kloop:                            ; i < (k+1)*241
+    MULI R2, R1, DIR_REFS
+    ADDI R2, R2, DIR_REFS
+    CMP3 R3, R4, R2
+    BRN R3, du_kdone
+    ADDI R1, R1, 1
+    CMPI3 R3, R1, DIR_LEVELS
+    BRN R3, du_kloop
+du_kdone:
+    ADD R2, R1, R0
+    push R2                          ; k
+    LDI R6, 0                        ; j = 0
+    LDI R1, FS_BASE
+    call blk_read                    ; superblock -> BBUF
+    const R5, BBUF + SB_ROOT
+    LDW R5, R5                       ; cur = root
+du_fwd:                              ; push the old lba of every level 0..4
+    push R5                          ; level j lba (0 = fresh)
+    CMPI3 R1, R5, 0
+    BRZ R1, du_fwd_zero              ; fresh chain: nothing to read (a read of
+    ADD R1, R5, R0                   ; lba 0 would pull in the boot block)
+    call blk_read                    ; old level-j block -> BBUF
+    const R5, BBUF + 3
+    LDW R5, R5                       ; cur = next
+    JMP du_fwd_next
+du_fwd_zero:
+    LDI R5, 0
+du_fwd_next:
+    ADDI R6, R6, 1
+    CMPI3 R1, R6, DIR_LEVELS
+    BRN R1, du_fwd                   ; j < DIR_LEVELS
+    LDI R6, 4                        ; clone levels 4..0 (R6 = level)
+    LDI R3, 0                        ; deeper clone (none at level 4)
+    LDI R5, 0                        ; new root (set at level 0)
+du_clone:
+    LDI R1, 4
+    SUB R1, R1, R6                   ; 4 - level -> stack offset of this level
+    MULI R1, R1, 3
+    ADD R1, R8, R1
+    LDW R2, R1                       ; cur = old lba of this level
+    CMPI3 R5, R2, 0
+    BRZ R5, du_fresh
+    push R3                          ; deeper clone across the read (blk_read
+    ADD R1, R2, R0                   ; clobbers R3; the push/pop is balanced
+    call blk_read                    ; so du_mut sees the unshifted R8)
+    pop R3
+    JMP du_mut
+du_fresh:                            ; first commit (or fresh level): start
+    push R3                          ; from a zeroed block; R3 (the deeper
+    LDI R3, 0                        ; clone) parks on the stack across the
+    LDI R2, 0                        ; zeroing loop
+du_zloop:
+    const R1, BBUF
+    ADD R1, R1, R3
+    STW R1, R2
+    ADDI R3, R3, 3
+    CMPI3 R5, R3, 729
+    BRN R5, du_zloop
+    pop R3
+du_mut:
+    ; count word: fixed per level (241 refs; 36 in the top level) — a
+    ; DELETE passes value 0 but the counts never change: the chain is
+    ; always full-size
+    CMPI3 R1, R6, 4
+    BRZ R1, du_cnt36
+    LDI R1, 241
+    JMP du_cntwr
+du_cnt36:
+    LDI R1, 36
+du_cntwr:
+    const R2, BBUF
+    STW R2, R1
+    ; slot mutation at the slot's own level k ([R8+15])
+    LDI R1, 15
+    ADD R1, R8, R1
+    LDW R2, R1                       ; k
+    CMP3 R1, R6, R2                  ; this level == k?
+    BRNZ R1, du_next1
+    MULI R2, R2, DIR_REFS
+    LDI R1, 18
+    ADD R1, R8, R1
+    LDW R1, R1                       ; i
+    SUB R1, R1, R2                   ; s = i - k*241
+    MULI R1, R1, 3
+    ADDI R1, R1, 6                   ; &refs[s] within the block
+    const R2, BBUF
+    ADD R1, R2, R1
+    LDI R2, 21
+    ADD R2, R8, R2
+    LDW R2, R2                       ; value
+    STW R1, R2                       ; refs[s] = value
+du_next1:
+    ; next links: level 4 keeps the old block's link — BBUF+3 already holds
+    ; it (the old next from the blk_read, or 0 for a fresh zeroed block);
+    ; deeper levels chain to the previously written clone
+    CMPI3 R1, R6, 4
+    BRZ R1, du_alloc
+    const R2, BBUF + 3
+    STW R2, R3                       ; next = deeper clone
+du_alloc:
+    call free_alloc                  ; R1 = clone lba (R2..R5 restored inside)
+    push R1                          ; clone lba on the stack
+    ADD R2, R1, R0
+    ADD R1, R2, R0
+    call blk_write                   ; write the clone (BBUF -> disk)
+    pop R1                           ; clone lba
+    ADD R3, R1, R0                   ; new = this clone
+    CMPI3 R1, R6, 0
+    BRNZ R1, du_lvlup
+    ADD R5, R3, R0                   ; level 0: new root = the clone. R3 — the
+                                     ; CMPI3 above just overwrote R1 with the
+                                     ; compare result, so R1 is NOT the lba
+du_lvlup:
+    ADDI R6, R6, -1
+    CMPI3 R1, R6, -1
+    BRZ R1, du_done
+    JMP du_clone
+du_done:
+    ; swap the root atomically, then reclaim the old chain (old root parked
+    ; at [R8+12]): the new chain shares nothing with the old one, so all
+    ; five old levels are dead the instant the superblock write lands
+    LDI R1, FS_BASE
+    call blk_read                    ; superblock -> BBUF
+    const R2, BBUF + SB_ROOT
+    STW R2, R5                       ; ROOT = new root
+    const R2, BBUF + SB_GEN
+    LDW R1, R2
+    ADDI R1, R1, 1
+    STW R2, R1                       ; GEN += 1
+    const R1, BBUF
+    call super_sum                   ; refresh the superblock checksum
+    LDI R1, FS_BASE
+    call blk_write                   ; the commit point
+    LDI R1, 12
+    ADD R1, R8, R1
+    LDW R3, R1                       ; cur = old root (0: first commit)
+    CMPI3 R1, R3, 0
+    BRZ R1, du_frdone
+du_freep:
+    push R3                          ; cur across the read
+    ADD R1, R3, R0
+    call blk_read                    ; old block -> BBUF (free to clobber:
+                                     ; every clone is safely on disk)
+    const R2, BBUF + 3
+    LDW R4, R2                       ; next (free_free keeps R4..R6)
+    pop R3                           ; cur
+    ADD R1, R3, R0
+    call free_free                   ; reclaim it
+    ADD R3, R4, R0                   ; cur = next
+    CMPI3 R1, R3, 0
+    BRZ R1, du_frdone
+    JMP du_freep
+du_frdone:
+    LDI R1, 24                       ; drop 5 path words + 3 entry words
+    ADD R8, R8, R1
+    pop R6
+    pop R5
+    pop R4
+    pop R3
+    pop R7
+    ret
+
+super_sum:                            ; R1 = superblock image base (BBUF or
+    ADD R3, R1, R0                    ; BB2) -> refresh [base+SB_SUM] = sum of
+    LDW R1, R3                        ; the six header words (ADD wraps
+    ADDI R3, R3, 3                    ; modulo 3^18 natively). The host-side
+    LDW R2, R3                        ; trifs.read_super validates this word.
+    ADD R1, R1, R2                    ; Clobbers R1..R3. NOTE: the base MUST be
+    ADDI R3, R3, 3                    ; passed — an earlier version hardcoded
+    LDW R2, R3                        ; BBUF, so the free-list helpers (whose
+    ADD R1, R1, R2                    ; super copy lives in BB2) checksummed
+    ADDI R3, R3, 3                    ; whatever dir clone was staged in BBUF
+    LDW R2, R3                        ; and wrote the result over refs[4] at
+    ADD R1, R1, R2                    ; tryte 18 — corrupting every 5th slot.
+    ADDI R3, R3, 3
+    LDW R2, R3
+    ADD R1, R1, R2                    ; w4 (base+12 = SB_ROOT)
+    ADDI R3, R3, 3
+    LDW R2, R3
+    ADD R1, R1, R2                    ; w5 (base+15 = SB_GEN)
+    ADDI R3, R3, 3
+    STW R3, R1                        ; [base+SB_SUM] = sum
+    ret
+
+; ------------------------------------------------------------------------------
+; fs_main — TriFS server (M7). CALL(op, index) protocol; replies status:
+;   op 1 CREATE(i)  -> 0 (header + payload block, dir slot i updated, COW)
+;   op 2 CHECK(i)   -> 0 ok / -1 sum mismatch / -2 missing
+;   op 3 DELETE(i)  -> 0 (blocks returned to the free list, slot zeroed)
+;   op 4 STATUS     -> msg1 = root, msg2 = gen
+;   op 5 FSCK       -> msg1 = ok count, msg2 = total
+; ------------------------------------------------------------------------------
+fs_main:
+    ADD R6, R1, R0                   ; fs cap
+    const R2, FS_CAP
+    STW R2, R1                       ; park the cap in MEMORY (D-041): the
+                                     ; format loop below uses R6 as scratch
+    ; self-format when the superblock magic does not match (D-042)
+    LDI R1, FS_BASE
+    call blk_read                    ; super -> BBUF
+    const R2, BBUF
+    LDW R3, R2                       ; magic
+    const R2, FS_MAGIC
+    CMP3 R5, R3, R2
+    BRZ R5, fm_ok
+    ; format: chain every fs block except the superblock
+    LDI R5, FS_BASE + 1              ; lba
+fm_chain:
+    ADD R1, R5, R0
+    call blk_read                    ; old content -> BBUF
+    ADDI R4, R5, 1                   ; next = lba + 1 (default)
+    const R3, FS_BASE + FS_NB - 1
+    CMP3 R6, R5, R3                  ; R6 = sign(lba - last); R5 keeps the lba!
+    BRN R6, fm_link
+    LDI R4, 0                        ; the last block ends the list
+fm_link:
+    const R2, BBUF
+    STW R2, R4                       ; first word = next
+    ADD R1, R5, R0
+    call blk_write
+    const R2, BLK_STAT
+    LDW R6, R2                       ; negative status = disk too small
+    CMPI3 R6, R6, 0
+    BRN R6, fm_bad
+    ADDI R5, R5, 1                   ; lba++
+    const R3, FS_BASE + FS_NB
+    CMP3 R6, R5, R3
+    BRN R6, fm_chain
+    ; superblock: [magic, base, nblocks, free_head, root, gen, sum]
+    LDI R1, FS_BASE
+    call blk_read                    ; -> BBUF (zeros)
+    const R2, BBUF
+    const R1, FS_MAGIC
+    STW R2, R1
+    const R2, BBUF + 3
+    LDI R1, FS_BASE
+    STW R2, R1
+    const R2, BBUF + 6
+    LDI R1, FS_NB
+    STW R2, R1
+    const R2, BBUF + 9
+    LDI R1, FS_BASE + 1
+    STW R2, R1                       ; free head
+    const R2, BBUF + 12
+    LDI R1, 0
+    STW R2, R1                       ; root = 0 (empty tree)
+    const R2, BBUF + 15
+    LDI R1, 0
+    STW R2, R1                       ; gen = 0
+    const R1, BBUF
+    call super_sum                   ; checksum over the six header words
+    LDI R1, FS_BASE
+    call blk_write
+    const R2, BLK_STAT
+    LDW R3, R2
+    CMPI3 R5, R3, 0
+    BRN R5, fm_bad
+    LDI R1, 0
+    const R2, FS_OKFLAG
+    STW R2, R1                       ; fs usable
+    JMP fm_ok
+fm_bad:
+    LDI R1, 1
+    const R2, FS_OKFLAG
+    STW R2, R1                       ; disk too small: fs unavailable
+fm_ok:
+fsm_loop:
+    const R2, FS_CAP
+    LDW R2, R2                       ; cap re-read per call (D-041)
+    LDI R1, 9                        ; RECV
+    TRAP 0                           ; R3 = op, R4 = index
+    CMPI3 R1, R3, 1
+    BRZ R1, fsop_create
+    CMPI3 R1, R3, 2
+    BRZ R1, fsop_check
+    CMPI3 R1, R3, 3
+    BRZ R1, fsop_delete
+    CMPI3 R1, R3, 4
+    BRZ R1, fsop_status
+    CMPI3 R1, R3, 5
+    BRZ R1, fsop_fsck
+    LDI R3, -4                       ; unknown op
+    LDI R4, 0
+    JMP fsm_reply
+fsop_create:
+    call free_alloc                  ; R1 = header lba (preserves R2..R6)
+    CMPI3 R5, R1, 0
+    BRN R5, fc_enomem
+    ADD R3, R1, R0                   ; h_ref
+    call free_alloc                  ; R1 = data lba
+    CMPI3 R5, R1, 0
+    BRN R5, fc_enomem
+    ADD R2, R1, R0                   ; d_ref
+    ADD R1, R4, R0                   ; i
+    call data_fill                   ; BBUF = payload(i) (keeps R2..R4, R6)
+    const R1, BBUF
+    call sum_calc                    ; R1 = sum (clobbers R5 only besides args)
+    ADD R5, R1, R0                   ; sum
+    ; save d_ref / h_ref / sum BEFORE the payload write: blk_write clobbers
+    ; R2 and R3. Pop order must be sum -> d_ref -> h_ref, so push h_ref
+    ; first (deepest), then d_ref, then sum (top).
+    push R3                          ; h_ref
+    push R2                          ; d_ref
+    push R5                          ; sum
+    ADD R1, R2, R0
+    call blk_write                   ; data block -> disk
+    pop R1                           ; sum
+    const R2, BBUF + 3
+    STW R2, R1                       ; [BBUF+3] = sum
+    pop R1                           ; d_ref
+    const R2, BBUF + 9
+    STW R2, R1                       ; ext[0] = d_ref
+    const R2, BBUF
+    LDI R1, 729
+    STW R2, R1                       ; len = 729
+    const R2, BBUF + 6
+    LDI R1, 1
+    STW R2, R1                       ; ext count = 1
+    pop R1                           ; h_ref
+    ADD R1, R1, R0
+    call blk_write                   ; header -> disk
+    ADD R2, R1, R0                   ; value = h_ref
+    ADD R1, R4, R0                   ; i
+    call dir_upd                     ; COW slot update + root swap
+    LDI R3, 0                        ; status ok
+    LDI R4, 0
+    JMP fsm_reply
+fc_enomem:
+    LDI R3, -3                       ; out of fs blocks
+    LDI R4, 0
+    JMP fsm_reply
+fsop_check:
+    ADD R1, R4, R0
+    call fs_check_one                ; R1 = status
+    ADD R3, R1, R0
+    JMP fsm_reply
+fsop_delete:
+    ; dir lookup (same walk as check), then free blocks + zero the slot.
+    ; The slot index stays on the stack the whole time: fs_lookup and the
+    ; helpers below clobber R2..R5, and the single pop at fd_hdr must
+    ; uncover it after h_ref is freed.
+    push R4                          ; i
+    ADD R1, R4, R0
+    ADD R1, R1, R0
+    ADD R1, R4, R0
+    call fs_lookup                   ; R1 = h_ref or 0 (clobbers R2..R5)
+    push R1                          ; h_ref
+    CMPI3 R5, R1, 0
+    BRZ R5, fd_missing
+    ; free the data extents from the header
+    ADD R1, R1, R0
+    call blk_read                    ; header -> BBUF
+    const R2, BBUF + 6
+    LDW R5, R2                       ; ext count
+    LDI R4, 0
+fd_ext:
+    CMP3 R1, R4, R5
+    BRZP R1, fd_hdr
+    MULI R3, R4, 3
+    ADDI R3, R3, 9
+    const R2, BBUF
+    ADD R1, R2, R3
+    LDW R1, R1                       ; d_ref
+    call free_free
+    ADDI R4, R4, 1
+    JMP fd_ext
+fd_hdr:
+    pop R1                           ; h_ref
+    call free_free
+    pop R1                           ; i
+    LDI R2, 0
+    call dir_upd                     ; slot[i] = 0 (COW)
+    LDI R3, 0                        ; ok
+    LDI R4, 0
+    JMP fsm_reply
+fd_missing:
+    pop R1                           ; h_ref (0)
+    pop R1                           ; i
+    LDI R3, -2
+    LDI R4, 0
+    JMP fsm_reply
+fsop_status:
+    const R2, FS_OKFLAG
+    LDW R1, R2
+    CMPI3 R5, R1, 0
+    BRZ R5, fst_ok
+    LDI R3, -1                       ; fs unavailable (small disk)
+    LDI R4, 0
+    JMP fsm_reply
+fst_ok:
+    LDI R1, FS_BASE
+    call blk_read
+    const R2, BBUF + SB_ROOT
+    LDW R3, R2                       ; reply1 = root
+    const R2, BBUF + SB_GEN
+    LDW R4, R2                       ; reply2 = gen
+    JMP fsm_reply
+fsop_fsck:
+    ; walk the whole dir chain and check every slot: per-block counts sum
+    ; to the full ref vector (1000 for the M7 workload). Counters park on
+    ; the stack: cur [R8], gi [R8+3], total [R8+6], ok [R8+9]; the current
+    ; block's count rides on top while its slots are visited.
+    LDI R1, FS_BASE
+    call blk_read                    ; super -> BBUF
+    const R2, BBUF + SB_ROOT
+    LDW R3, R2                       ; root
+    LDI R2, 0
+    push R2                          ; ok
+    push R2                          ; total
+    push R2                          ; gi (global slot index)
+    ADD R2, R3, R0
+    push R2                          ; cur (dir block lba)
+fk_blk:
+    LDW R1, R8                       ; cur
+    CMPI3 R2, R1, 0
+    BRZ R2, fk_done
+    ADD R1, R1, R0
+    call blk_read                    ; dir block -> BBUF
+    const R2, BBUF
+    LDW R5, R2                       ; count of this block
+    ADD R2, R5, R0
+    push R2                          ; cnt [R8] (cur shifts to [R8+3])
+    LDI R4, 0                        ; s = 0
+fk_slot:
+    LDW R1, R8                       ; cnt
+    CMP3 R2, R4, R1
+    BRZP R2, fk_nxt                  ; s >= count -> next block
+    LDI R1, 6
+    ADD R1, R8, R1
+    LDW R2, R1                       ; gi
+    ADD R1, R2, R4                   ; global slot index = gi + s
+    ADD R1, R1, R0
+    push R4                          ; park s across fs_check_one
+    call fs_check_one                ; R1 = status (stack-neutral)
+    pop R4                           ; s
+    CMPI3 R2, R1, 0
+    BRNZ R2, fk_bad
+    LDI R1, 12
+    ADD R1, R8, R1
+    LDW R2, R1
+    ADDI R2, R2, 1
+    STW R1, R2                       ; ok++
+fk_bad:
+    LDI R1, 9
+    ADD R1, R8, R1
+    LDW R2, R1
+    ADDI R2, R2, 1
+    STW R1, R2                       ; total++
+    ADDI R4, R4, 1
+    JMP fk_slot
+fk_nxt:
+    ; gi += cnt; cur = next of this block; drop cnt. fs_check_one clobbered
+    ; BBUF, so the block is re-read for its next pointer
+    LDI R1, 6
+    ADD R1, R8, R1
+    LDW R2, R1                       ; gi
+    LDW R3, R8                       ; cnt
+    ADD R2, R2, R3
+    STW R1, R2                       ; gi += cnt
+    LDI R1, 3
+    ADD R1, R8, R1
+    LDW R1, R1                       ; cur
+    ADD R1, R1, R0
+    call blk_read                    ; dir block -> BBUF
+    const R2, BBUF + 3
+    LDW R2, R2                       ; next
+    ADDI R8, R8, 3                   ; drop cnt
+    STW R8, R2                       ; cur = next
+    JMP fk_blk
+fk_done:
+    ADDI R8, R8, 6                   ; drop cur + gi
+    pop R4                           ; total (msg2)
+    pop R3                           ; ok (msg1)
+    JMP fsm_reply
+fsm_reply:
+    LDI R1, 11                       ; REPLY
+    const R2, FS_CAP
+    LDW R2, R2                       ; cap re-read per call (D-041)
+    TRAP 0                           ; msg1 = R3, msg2 = R4
+    JMP fsm_loop
+
+fs_lookup:                           ; R1 = slot i -> R1 = h_ref or 0 (clobbers
+    push R7                          ; R2..R5; keeps R6)
+    push R2
+    push R3
+    push R4
+    push R5
+    ADD R4, R1, R0                   ; i
+    LDI R1, FS_BASE
+    call blk_read                    ; super -> BBUF
+    const R3, BBUF + SB_ROOT
+    LDW R3, R3                       ; cur = root
+    LDI R5, 0                        ; k
+fl_kloop:
+    MULI R2, R5, DIR_REFS
+    CMP3 R2, R4, R2
+    BRN R2, fl_kdone
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 6
+    BRN R2, fl_kloop
+fl_kdone:
+    ADDI R5, R5, -1                  ; k
+    MULI R2, R5, DIR_REFS
+    SUB R2, R4, R2                   ; s = i - k*241
+    push R2                          ; s [R8]
+fl_walk:
+    CMPI3 R1, R5, 0
+    BRZ R1, fl_at
+    ADD R1, R3, R0
+    call blk_read                    ; cur -> BBUF
+    const R3, BBUF + 3
+    LDW R3, R3                       ; cur = next
+    ADDI R5, R5, -1
+    JMP fl_walk
+fl_at:
+    ADD R1, R3, R0
+    call blk_read                    ; the level-k dir block -> BBUF
+    pop R2                           ; s
+    MULI R3, R2, 3
+    ADDI R3, R3, 6
+    const R2, BBUF
+    ADD R2, R2, R3
+    LDW R1, R2                       ; h_ref
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+
+fs_check_one:                        ; R1 = i -> R1 = status (clobbers R2..R5,
+    push R7                          ; keeps R6)
+    push R2
+    push R3
+    push R4
+    push R5
+    ADD R4, R1, R0                   ; i
+    ADD R1, R4, R0
+    call fs_lookup                   ; R1 = h_ref (clobbers R2/R3; R4 = i kept)
+    CMPI3 R5, R1, 0
+    BRZ R5, fcm_missing
+    ADD R1, R1, R0
+    call blk_read                    ; header -> BBUF
+    const R2, BBUF + 3
+    LDW R3, R2                       ; expected sum
+    push R3                          ; expected [R8+3]
+    LDI R2, 0
+    push R2                          ; acc [R8]
+    const R2, BBUF + 6
+    LDW R5, R2                       ; ext count
+    LDI R4, 0                        ; e
+fcm_ext:
+    CMP3 R1, R4, R5
+    BRZP R1, fcm_cmp
+    MULI R1, R4, 3
+    ADDI R1, R1, 9
+    const R2, BBUF
+    ADD R1, R2, R1
+    LDW R1, R1                       ; d_ref
+    ADD R1, R1, R0
+    call blk_read                    ; data -> BBUF
+    const R1, BBUF
+    call sum_calc                    ; R1 = ext sum
+    LDW R2, R8                       ; acc
+    ADD R2, R2, R1                   ; acc += ext sum
+    STW R8, R2                       ; store back
+    ADDI R4, R4, 1
+    JMP fcm_ext
+fcm_cmp:
+    pop R1                           ; acc = file sum
+    pop R3                           ; expected
+    CMP3 R2, R1, R3
+    BRNZ R2, fcm_corrupt
+    LDI R1, 0                        ; ok
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+fcm_corrupt:
+    ; NOTE: fcm_cmp already popped acc+expected before branching here —
+    ; an extra drop here double-freed 6 trytes and corrupted R7 (the "wild
+    ; jump into the boot region" M7 bug). Only the register saves remain.
+    LDI R1, -1
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+fcm_missing:
+    LDI R1, -2
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    pop R7
+    ret
+
+
+; ------------------------------------------------------------------------------
 ; m4_main — the main thread (tid 1): scheduler self-test
 ; ------------------------------------------------------------------------------
 m4_main:
@@ -2746,6 +3604,129 @@ m5_done:
     const R1, str_restart
     call puts
 
+    ; ---- M7 phase: TriFS (D-042) ----
+    LDI R1, 17                       ; EP_CREATE the fs endpoint
+    LDI R2, 4                        ; badge
+    TRAP 0
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    const R3, XFS
+    STW R3, R1
+    const R2, fs_main
+    const R4, XFS
+    LDW R4, R4                       ; arg = fs cap
+    LDI R3, 0                        ; class = normal (loaded LAST)
+    LDI R1, 3
+    TRAP 0                           ; create the fs server
+    CMPI3 R5, R1, 0
+    BRN R5, st_fail2
+    LDI R1, 1                        ; YIELD: let it RECV-block
+    TRAP 0
+    ; STATUS decides: root == 0 -> fresh fs (run the workload); an existing
+    ; root (power-cut resume or repeated boot) runs the fsck path only
+    const R3, XFS
+    LDW R2, R3                       ; cap re-read per call (D-041)
+    LDI R3, 4                        ; STATUS
+    LDI R4, 0
+    LDI R1, 10                       ; CALL
+    TRAP 0                           ; R3 = root, R4 = gen
+    CMPI3 R5, R3, 0
+    BRN R5, m5_done2                 ; fs unavailable (small disk): skip M7
+    BRZ R5, m7_create                ; root == 0: fresh workload
+    JMP m7_fsck                      ; root > 0: fsck (resume/reboot)
+    ; fresh: create 1000 files
+    LDI R5, 0
+m7_create:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 1                        ; CREATE
+    ADD R4, R5, R0                   ; index = i
+    LDI R1, 10                       ; CALL
+    TRAP 0
+    CMPI3 R2, R3, 0
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 1000
+    BRN R2, m7_create
+    ; check all 1000
+    LDI R5, 0
+m7_check:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 2                        ; CHECK
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, 0
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 1000
+    BRN R2, m7_check
+    ; delete 0..499
+    LDI R5, 0
+m7_del:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 3                        ; DELETE
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, 0
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 500
+    BRN R2, m7_del
+    ; deleted slots must report missing (-2)
+    LDI R5, 0
+m7_chkd:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 2
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, -2
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 500
+    BRN R2, m7_chkd
+    ; 500..999 must still check ok
+m7_kee:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 2
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, 0
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 1000
+    BRN R2, m7_kee
+    const R1, str_m7ok
+    call puts
+    JMP m5_done2
+m7_fsck:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 5                        ; FSCK
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0                           ; R3 = ok count, R4 = total
+    push R4                          ; park the reply on the stack: puts
+    push R3                          ; clobbers R3 (its string pointer), so
+    const R1, str_fsck               ; an earlier version printed
+    call puts                        ; str_fsck+6 (=30588) as the ok count
+    pop R1                           ; ok
+    call putnum
+    LDI R1, 47                       ; '/'
+    call putc
+    pop R1                           ; total
+    call putnum
+    LDI R1, 10
+    call putc
+    JMP m5_done2
+
 m5_done2:                            ; init: ready. Console input waiting ->
                                      ; hand the system to the shell; headless
                                      ; boot -> clean power-off.
@@ -2901,6 +3882,8 @@ str_cmd_halt:    .asciz "halt"
 str_cmd_echo:    .asciz "echo "
 str_unknown:     .asciz "unknown command\n"
 str_conrestart:  .asciz "console restarted\n"
+str_m7ok:        .asciz "fs: 1000 created+checked, 500 deleted, ok\n"
+str_fsck:        .asciz "fsck: "
 str_test_fail:   .asciz "self-test: FAIL\n"
 .equ FZROWS,     16
 

@@ -457,3 +457,62 @@ M5 ping-pong re-reads the cap slot every iteration for the same reason).
 **Reason:** the frame is the syscall ABI; overwriting two fixed slots keeps the
 kernel push-free in the handoff (no R8-slide hazard) and makes the caller-visible
 contract explicit and auditable.
+
+## D-042 — 2026-11-22 — TriFS v0.1 on-disk layout: index-keyed COW tree with atomic root swap
+**Choice:** the fs lives in 729-tryte blocks starting at FS_BASE = 28 (blocks 0..27 are
+the boot sector + kernel TXE). Superblock (block 28): magic, fs_base, nblocks,
+free_head, root (head of the COW directory chain), gen (monotone counter bumped on
+every root swap), sum (simple balanced sum of the superblock words). Directory blocks
+are ref-vectors keyed by file index ("f0".."fN": name is implicit, no name scan —
+O(1) lookup): [count, next, ref × 242] chained through `next` when count > 242.
+File header block: [len_trytes, sum, ext_count, ext_refs...]; each extent is one full
+data block. Free list: first word of a free block = next free ref; COW garbage is NOT
+recycled (only deleted files' blocks return to the list) so snapshots stay readable.
+Every mutation clones blocks along the touched path and swaps the superblock root
+(last, single word-write) — a crash at any cycle leaves the previous root's tree
+fully consistent; boot-time fsck walks root + verifies sums.
+**Reason:** index-keying removes name management entirely for v0.1 (the accept
+criterion is 1000 indexed files), path-cloning bounds a mutation at ~6 block writes
+(5 dir blocks max), and the atomic root swap is the whole crash-consistency story —
+no journal needed at this scale.
+
+## D-043 — 2026-11-25 — Fixed-depth COW dir chain: 5 levels, full clone + free per commit
+**Choice:** the directory is ALWAYS a 5-block chain (DIR_LEVELS=5; per-level counts
+241/241/241/241/36 = 1000 slots), never shallower, even when few slots are used.
+Every dir_upd walks all 5 levels, clones all 5, mutates the one touched slot,
+swaps the superblock root (gen += 1), then frees the old 5 blocks. Net cost per
+create = 2 blocks (6 written, 5 released); 1000 creates + 500 deletes peak at
+~2005 allocated blocks <= 2199 free.
+**Reason:** a variable-depth chain needs per-block counts and split entries that
+the host-side reader must handle, and the first version that freed old chains
+only on overflow exhausted the free list at ~585 creates (nothing reclaimed the
+COW garbage). A fixed depth makes the on-disk contract trivial (count is
+constant per level), keeps `read_dir_chain` exact, and bounds every commit at
+11 block writes — and the workload still fits the 2228-block test disk.
+
+## D-044 — 2026-11-25 — Host-side disk words are TRYTE triples: decode with trytes_to_word
+**Choice:** `blocks[lba]` (BlockDevice and every host-side reader) is a list of 729
+TRYTES; an 18-trit word spans 3 trytes and must be decoded with `trit.trytes_to_word`,
+never `trit.from_trits` (which expects three trits in {-1,0,1} and silently produces
+garbage for any tryte outside +-1 — the magic read back as 2667, nblocks as 22).
+`read_super` returns its words indexed BY SB_* TRYTE OFFSET so callers can write
+sb[SB_ROOT]/sb[SB_GEN] directly.
+**Reason:** the M7 acceptance tests failed with "bad fs magic" although a device-op
+trace proved every kernel superblock write carried the correct magic, base and
+nblocks — the kernel was right, the HOST decoder was wrong. Only two word values
+(< 3 per tryte) decode identically under both functions, so the bug hides until a
+large value (magic, sums, lengths) crosses the boundary. Audit rule: any host-side
+`from_trits(slice-of-block)` is a bug.
+
+## D-045 — 2026-11-25 — `puts` (and friends) clobber R3: park syscall replies across calls
+**Choice:** helper functions may freely use R2/R3 as scratch (only R7 is protected by
+convention, D-040). A caller that must use a syscall reply (R3/R4) AFTER an
+intermediate call (e.g. print the label with `puts` before the value with `putnum`)
+must park the reply: on the stack (m7_fsck pushes R4/R3 and pops them after puts)
+or in MEMORY.
+**Reason:** m7_fsck printed `str_fsck+6` (=30588) as the fsck ok count because puts
+holds its string pointer in R3 — the reply register — and the fsck line then showed
+"fsck: 30588/1000" while the server had correctly replied 499/1000. The kernel-side
+state was perfect; only the presentation register was stale. Same audit pattern as
+D-040/D-041: anything live across a `call` or a `TRAP` must live in callee-saved
+slots, not in R1/R2/R3.

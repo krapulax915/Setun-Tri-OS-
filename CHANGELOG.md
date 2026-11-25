@@ -2,6 +2,39 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M7 — 2026-11-25 — TriFS: COW directory tree, extents, crash consistency (D-042..D-045)
+- `kernel/kernel.asm`: TriFS server (fs_main, CALL op 1..5 = CREATE/CHECK/DELETE/
+  STATUS/FSCK). Format-on-first-use (superblock magic probe): chained free list,
+  superblock `[magic, base, nblocks, free_head, root, gen, sum]` with the checksum
+  refreshed by `super_sum(base)` on EVERY super write (format, free_alloc,
+  free_free, dir_upd commit). Directory: fixed 5-level COW chain (DIR_LEVELS=5,
+  5x241 = 1205 slots >= the 1000-file workload), per-level fixed counts
+  (241/241/241/241/36); `dir_upd` walks + clones all 5 levels, mutates the one
+  touched slot, swaps the superblock root atomically (gen += 1), then frees the
+  old 5-block chain — crash consistency = single-word root swap. Files: header
+  block `[len, sum, ext_count, ext_refs...]` + one full 729-tryte data block per
+  extent; `sum_calc` (sum of tryte values) verified by CHECK and boot fsck.
+- Bug fixes this milestone (all register-clobber class, see D-040/D-045):
+  free_alloc kept the free-list "next" in R2 and free_free the old head in R3 —
+  both clobbered by the blk_read2 in between (free list wrecked from the first
+  alloc); du_alloc's `CMPI3` overwrote the clone lba (root written as 0);
+  super_sum originally summed 5 words and stored into SB_GEN, and an earlier
+  revision hardcoded BBUF while the free-list helpers stage in BB2 (checksum
+  written over refs[4]); m7_fsck printed `str_fsck+6` (30588) as the ok count
+  because `puts` clobbers R3 — reply values now park on the stack across puts.
+- `tools/trifs.py`: host-side decoders fixed — blocks are tryte lists, so words
+  decode with `trytes_to_word`, NOT `from_trits` (the old code read the magic
+  back as 2667); `read_super` now returns words indexed by their SB_* tryte
+  offsets; `make_superblock`/`format_fs` use `word_to_trytes` (was a missing
+  alias). `tests/test_m7.py`: ext[0] decode fixed the same way.
+- Boot flow: STATUS decides fresh-vs-resume — root == 0 runs the 1000-file
+  workload, root > 0 (power-cut resume / repeated boot) runs fsck only.
+- `tests/test_m7.py`: 3 tests — full workload (1000 created+verified, 500
+  deleted, host-side tree check), power cut at a seeded random step leaves a
+  readable tree whose survivors are all intact and whose reboot fscks cleanly,
+  injected tryte flip in a data block is caught by fsck (ok < 500).
+- Tests: 115 green (112 + 3). DECISIONS: D-043, D-044, D-045.
+
 ## M6 — 2026-11-22 — Interactive shell over the console server (D-041)
 - `kernel/kernel.asm`: GETCHAR syscall (num 18): reads one TriText tryte from the
   UART, yield-polls via sched_requeue_cur when the input is empty, so the shell
