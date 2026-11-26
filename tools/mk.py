@@ -175,8 +175,8 @@ def assemble(args):
             lines.append(".equ %s_TXE_LEN, %d" % (name.upper(), len(trytes)))
             lines.append("%s_txedata:" % name)
             lines.append("    .tryte " + ", ".join(str(t) for t in trytes))
-        with open(hello_inc, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        from pathlib import Path
+        Path(hello_inc).write_text("\n".join(lines) + "\n", encoding="utf-8")
         made.append("hello_txedata.asm")
     # boot ROM (M2)
     if os.path.exists(ROM_SRC_PATH):

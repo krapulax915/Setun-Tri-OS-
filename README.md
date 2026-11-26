@@ -35,7 +35,7 @@ Core numbers / Alapadatok:
 | Page / oldal | 729 trytes / tryte |
 | ISA | 49 opcodes, 4-trit op field, `[op:4\|rd:2\|rs:2\|imm:10]` |
 | Compare / összehasonlítás | three-way, no flags / háromutas, nincs flag-regiszter |
-| Tests / tesztek | 112 green / zöld |
+| Tests / tesztek | 120 green / zöld |
 
 ## Status / Állapot
 
@@ -56,8 +56,9 @@ tesztkészlettel. A jelenlegi állapot:
 | M4 | Threads + scheduler (3 priority classes, timer preemption) | ✅ |
 | M5 | IPC + capability system (sticky deny, subtree revoke), 200-call ping-pong, syscall fuzz | ✅ |
 | M6 | Userspace: init, console + interactive shell (echo via IPC, crash → restart) | ✅ |
-| M7 | TriFS filesystem + fs server (COW, snapshots, checksums, power-cut test) | 🚧 planned / tervezett |
-| M8 | TXE loader + coreutils + pipes | 🚧 planned / tervezett |
+| M7 | TriFS filesystem + fs server (COW, snapshots, checksums, power-cut test) | ✅ |
+| M8 | TXE loader + coreutils + pipes | ✅ |
+| M9 | Profiler + `rle3`/`huff3` compression | 🚧 in progress / folyamatban |
 | M9 | Profiler + `rle3`/`huff3` compression | 🚧 planned / tervezett |
 | M10 | (optional / opcionális) Tern language + `HW_PORT.md` | 🚧 planned / tervezett |
 

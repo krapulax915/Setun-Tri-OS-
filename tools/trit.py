@@ -314,3 +314,79 @@ def tritext_decode(trytes) -> str:
             out.append(_REV_PAGE.get(t, FFFD))
         i += 1
     return "".join(out)
+
+
+# ---- M9: compression codecs (D-050) -------------------------------------------
+# Format: every codec returns a flat trit list. rle3 pairs each run with its
+# count (balanced 3-tryte word, |count| <= 8 per symbol, longer runs split).
+# huff3 uses a canonical ternary codebook: 3 symbols -> 2-trit codes, which is
+# the optimal fixed assignment for the v0.1 use case (TriText streams are
+# dominated by a few symbols).
+
+RLE3_MAX_RUN = 8                                   # 3-tryte balanced count
+
+
+def rle3(data):
+    """Run-length encode trits: for each run, [count word (3 trytes), symbol]."""
+    out = []
+    i, n = 0, len(data)
+    while i < n:
+        sym = data[i]
+        run = 1
+        while i + run < n and data[i + run] == sym and run < RLE3_MAX_RUN:
+            run += 1
+        out.extend(word_to_trytes(run))
+        out.append(sym)
+        i += run
+    return out
+
+
+def rle3_decode(enc):
+    """Inverse of rle3: repeats each symbol by its count word."""
+    out = []
+    i = 0
+    while i + 3 < len(enc):
+        count = trytes_to_word(enc[i:i + 3])
+        sym = enc[i + 3]
+        out.extend([sym] * count)
+        i += 4
+    return out
+
+
+def _huff3_codebook(symbols):
+    """Canonical ternary prefix code: 2 symbols -> 1 trit, 3 symbols -> 2 trits."""
+    s = sorted(symbols)
+    if len(s) == 1:
+        return {s[0]: [0]}
+    if len(s) == 2:
+        return {s[0]: [-1], s[1]: [1]}
+    return {s[0]: [-1, -1], s[1]: [-1, 1], s[2]: [1, -1]}
+
+
+def huff3(data):
+    """Ternary Huffman encode (canonical fixed codebook per distinct symbol set)."""
+    if not data:
+        return []
+    code = _huff3_codebook(set(data))
+    out = []
+    for sym in data:
+        out.extend(code[sym])
+    return out
+
+
+def huff3_decode(enc, symbols):
+    """Inverse of huff3 given the symbol set (the header carries it in a file)."""
+    code = _huff3_codebook(symbols)
+    rev = {tuple(v): k for k, v in code.items()}
+    out = []
+    i = 0
+    while i < len(enc):
+        for ln in (1, 2):
+            key = tuple(enc[i:i + ln])
+            if key in rev:
+                out.append(rev[key])
+                i += ln
+                break
+        else:
+            raise ValueError("bad huff3 stream at %d" % i)
+    return out

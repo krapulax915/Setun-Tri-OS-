@@ -1,7 +1,7 @@
 """M8 acceptance: loader + coreutils — a scripted shell session.
 
 A single scripted session exercises the whole M8 surface on a 2228-block
-disk: help / mkdir / ed / ls / cat / exec (TXE loader) / ps / tstat /
+disk: help / mkdir / ed / ls / cat / run-txe (loader) / ps / tstat /
 kill / cp / rm / cat-again / pipe / halt.  The kernel is assembled from
 source (no stale artifacts), the staged hello/spin programs are compiled
 from user/*.asm, and the session must end with a clean power-off, no
