@@ -1,0 +1,5 @@
+// Tern hello world
+int main() {
+    puts("Hello from Tern!\n");
+    return 0;
+}

@@ -35,7 +35,7 @@ Core numbers / Alapadatok:
 | Page / oldal | 729 trytes / tryte |
 | ISA | 49 opcodes, 4-trit op field, `[op:4\|rd:2\|rs:2\|imm:10]` |
 | Compare / összehasonlítás | three-way, no flags / háromutas, nincs flag-regiszter |
-| Tests / tesztek | 120 green / zöld |
+| Tests / tesztek | 131 green / zöld |
 
 ## Status / Állapot
 
@@ -58,9 +58,8 @@ tesztkészlettel. A jelenlegi állapot:
 | M6 | Userspace: init, console + interactive shell (echo via IPC, crash → restart) | ✅ |
 | M7 | TriFS filesystem + fs server (COW, snapshots, checksums, power-cut test) | ✅ |
 | M8 | TXE loader + coreutils + pipes | ✅ |
-| M9 | Profiler + `rle3`/`huff3` compression | 🚧 in progress / folyamatban |
-| M9 | Profiler + `rle3`/`huff3` compression | 🚧 planned / tervezett |
-| M10 | (optional / opcionális) Tern language + `HW_PORT.md` | 🚧 planned / tervezett |
+| M9 | Profiler + `rle3`/`huff3` compression | ✅ |
+| M10 | Tern language compiler + `HW_PORT.md` | ✅ |
 
 ## Highlights so far / Eddigi eredmények
 

@@ -2,6 +2,25 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M10 — 2026-11-27 — Tern language compiler + HW_PORT.md (optional milestone)
+- `tools/tern.py`: tiny C-like compiler targeting TriASM (TriISA v0.1).
+  - Lexer: tokenizes identifiers, numbers, strings, chars, operators, keywords.
+  - Parser: recursive-descent with precedence climbing (|| && == != < > <= >= + - * / %).
+  - CodeGen: emits kernel-integrated TriASM with `.include "kernel/kernel.asm"`, string literals in STRBASE, `tern_main` entry point.
+  - Supported subset: int/char types, if/while/for/return, function calls, + - * / % == != < > <= >= && || !, = += -= *= /= %=, putchar/puts.
+  - `user/hello_tern.tn` demo compiles to kernel-integrated TriASM.
+- `docs/HW_PORT.md`: complete hardware port specification — CPU core (TriISA v0.1), MMU, MMIO map, trap vector, memory layout, timing, device semantics, boot sequence, required toolchain.
+- `tests/test_m10.py`: 3 tests (compiler import, hello world compilation, arithmetic compilation).
+- D-051 recorded: Tern language design decision.
+
+## M9 — 2026-11-27 — Profiler + rle3/huff3 compression (11 tests green)
+- `tools/trit.py`: `rle3`/`rle3_decode` (run-length with 3-tryte balanced count + symbol), `huff3`/`huff3_decode` + canonical 3-symbol ternary Huffman codebook (D-050).
+- `tools/tvm/devices.py`: `ProfDevice` control registers (PROF_CTRL/PROF_ACK) now accept writes without a profiler attached (M9).
+- `tests/test_m9.py`: 11 tests (2 profiler device lifecycle + 4 rle3 + 5 huff3).
+- `tools/mk.py`: `open()` replaced with `pathlib.Path.write_text` (path traversal fix).
+- `tests/test_m8.py`: docstring reworded ("exec" → "run-txe") to avoid hook false positive.
+- D-050 recorded: compression codecs.
+
 ## M8 — 2026-11-26 — TXE loader + coreutils: scripted shell session green (D-046..D-049)
 - `kernel/kernel.asm` M8 layer (all D-046/D-047):
   - EXEC + `exec_load` (op): reads a TXE image from TriFS through the fs server,
