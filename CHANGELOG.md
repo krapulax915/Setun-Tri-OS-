@@ -2,6 +2,50 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M8 — 2026-11-26 — TXE loader + coreutils: scripted shell session green (D-046..D-049)
+- `kernel/kernel.asm` M8 layer (all D-046/D-047):
+  - EXEC + `exec_load` (op): reads a TXE image from TriFS through the fs server,
+    validates every segment against `[PROG_BASE=4700100, PROG_TOP=3^14)`, maps it
+    into the program region and creates a thread at the TXE entry (entry word read
+    with three LDT loads — container offset 8 is not 3-aligned).
+  - Namespace ops (server-side NTS, 48 x 30-tryte entries + FBUF, D-047):
+    CREATE/DELETE/NAMEGET/NAMESET/NAMECLEAR/LIST/MKDIR — `ls cat ed rm cp mkdir
+    exec` all go through them; directories are flags-only (on-disk format stays
+    flat, D-047).
+  - Shell coreutils: `ls` (with `dir/` rendering), `cat`, `ed` (line editor),
+    `cp` (create dst + copy content), `rm`, `mkdir`, `ps` (TCB table dump),
+    `tstat`, `kill`, `pipe` (endpoint round-trip), `exec`; boot staging writes
+    the embedded demo TXEs (`hello`, `spin`) into TriFS (`m8: hello program
+    staged`).
+- Bug fixes this milestone (register-clobber + alignment class):
+  - `ps_fill` read its stack slots in reverse push order — ps printed 27 garbage
+    rows; now matches the host TCB dump.
+  - FTAB lost its 3-alignment after the M8 string literals (.word table on a
+    byte-granular section) — fuzz selftest ALIGN-faulted at boot; `.align 3`.
+  - `fsop_mkdir` held the first-free entry ptr in R4 across `str_eq` (returns in
+    R3, clobbers R4..R6) — entry written to address 115; both live values parked.
+  - `fsop_nameset` picked the update target (R3, 0 for new names) instead of the
+    first-free entry (R1) — new entries were written to RAM address 0.
+  - `exec_load`: entry clobbered by the segcount LDT + len destroyed by CMP3 +
+    LR popped into R3 while `ret` = `JR R7` (D-040) — `exec hello` jumped into
+    garbage and looked like a spontaneous reboot; entry now parked on the stack,
+    checks use R6, all exits pop R7.
+  - Demo programs: `.org` addresses must be ≡ 0 mod 3 (D-048) — hello/spin moved
+    to 4705002/4706001.
+  - `fsop_nameclr` reused the flags-address register (R5) as the CMPI3
+    destination — `rm` of an EXISTING entry stored flags=0 to address 1 (kernel
+    code region); compare moved to R6.
+  - Shell line buffer: LBUF grown 24 -> 93 trytes, caps at 92 chars (D-049) — a
+    25-char `cp docs/notes docs/notes2` was silently truncated to the source
+    name and the copy landed under the SOURCE name.
+- `tests/test_m8.py`: scripted acceptance — one session (help, mkdir, ed, ls,
+  cat, exec, ps, tstat, kill, cp, cat, rm, cat, pipe, halt) must end with a
+  clean power-off, zero trap reports, correct replies (`cp ok` + `cat
+  docs/notes2` = content, `rm ok` + `no such name` after), `exec: tid 6`, and a
+  host-side NTS check: entry 4 is NAMED "docs/notes2" (the 25-char line proves
+  the D-049 buffer) and freed again by rm.
+- Tests: M8 session green; DECISIONS: D-046, D-047, D-048, D-049.
+
 ## M7 — 2026-11-25 — TriFS: COW directory tree, extents, crash consistency (D-042..D-045)
 - `kernel/kernel.asm`: TriFS server (fs_main, CALL op 1..5 = CREATE/CHECK/DELETE/
   STATUS/FSCK). Format-on-first-use (superblock magic probe): chained free list,

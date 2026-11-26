@@ -15,7 +15,7 @@
 - [ ] **M6 Userspace: init, console, shell.** *Accept:* shell prompt, builtins, crash of `console` server is restarted by `init`.
 - [ ] **M7 TriFS + fs server.** mkfs, COW tree, extents, snapshots. *Accept:* create/read/write/delete 1000 files, power-cut simulation
       (kill TVM at random cycle) leaves a consistent image, checksums detect injected corruption.
-- [ ] **M8 Loader + coreutils.** TXE loader, `ls cat echo ed ps kill tstat mkdir rm cp`, pipes. *Accept:* scripted shell session test.
+- [x] **M8 Loader + coreutils.** TXE loader, `ls cat echo ed ps kill tstat mkdir rm cp`, pipes. *Accept:* scripted shell session test.
 - [ ] **M9 Profiler + compression.** Profiler device + report; `rle3`, `huff3`. *Accept:* `make profile` on 5 workloads (compile, fs-heavy,
       IPC-heavy, matrix multiply, text processing) produces locality report; compression ratio report on TriText and binary-like data.
 - [ ] **M10 (optional) Tern language & HW port notes.** Small C-like compiler to TriASM; rewrite one server in it; write `docs/HW_PORT.md`

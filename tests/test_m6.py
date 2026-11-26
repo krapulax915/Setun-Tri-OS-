@@ -51,7 +51,10 @@ class TestShell(unittest.TestCase):
         m, code, text = boot_m6("help\nver\nhalt\n")
         self.assertIn("Setun shell (type help)", text)
         self.assertIn("$ help", text)
-        self.assertIn("builtins: help ver echo <text> crash halt", text)
+        # M8 grew the builtin list (ls/cat/ed/rm/cp/mkdir/ps/tstat/kill/
+        # exec/pipe) — assert the stable head and tail of the help line
+        self.assertIn("builtins: help ver echo <text> ls", text)
+        self.assertIn("pipe crash halt", text)
         self.assertIn("$ ver", text)
         self.assertIn("Setun Tri OS v0.1 (ternary)", text)
         self.assertEqual(code, 0)

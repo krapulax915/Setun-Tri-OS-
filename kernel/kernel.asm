@@ -34,12 +34,13 @@
     .equ KSAVE,      KDATA+9842+27      ; 11 words
     .equ PNUMBUF,    KSAVE+33           ; 12 trytes
     .equ NODES,      PNUMBUF+12         ; 6132 words (self-test array)
-    .equ RES_END,    1417               ; frames [0, 1417) reserved: static data
-                                        ; (TCBs, queues, idle stack, M4T, CTAB, EPT)
-                                        ; ends at 1031436, inside frame 1414;
-                                        ; frame 1415 is the fs free-list buffer,
-                                        ; frame 1416 the fs block buffer (TriFS).
-                                        ; D-043: BOTH fs frames must sit below
+    .equ RES_END,    1420               ; frames [0, 1420) reserved: static data
+                                        ; (TCBs, queues, idle stack, M4T, CTAB,
+                                        ; EPT, fs buffers, M8 namespace area).
+                                        ; frames 1415/1416 are the fs free-list
+                                        ; and block buffers (TriFS), 1417..1419
+                                        ; the M8 name table + file buffer.
+                                        ; D-043: fs frames must sit below
                                         ; RES_END or thread stacks corrupt them
     .equ BB2,       1415 * 729          ; 729-tryte free-list IO buffer (keeps
                                         ; BBUF intact while dir_upd stages a clone)
@@ -64,7 +65,7 @@
     .equ STK_LO,     6446
     .equ STK_HI,     6448
     .equ KSTACK,     4700001
-    .equ FREE_FRAMES, 5141              ; 6561 - 1417(reserved) - 3(stack)
+    .equ FREE_FRAMES, 5138              ; 6561 - 1420(reserved) - 3(stack)
     .equ FREE_TEST,   240               ; boot self-test allocation count
 
 ; ---- scheduler constants (D-033/D-034) ---------------------------------------
@@ -121,14 +122,41 @@
     .equ EPT,       CTAB + 1458         ; NEP x 18 trytes: used, rq_h, rq_t,
                                         ; sq_h, sq_t, caller
     .equ LLEN,      EPT + 162           ; shell: line length in trytes
-    .equ LBUF,      EPT + 165           ; shell: line buffer, 24 trytes (8 chars;
-                                        ; ends inside reserved frame 1414)
-    .equ FS_OKFLAG, EPT + 189           ; 0 = fs usable, 1 = device too small
-    .equ XFS,       EPT + 192           ; fs endpoint cap (word-aligned!)
-    .equ FS_CAP,    EPT + 195           ; fs server's own cap, parked in MEMORY
+    .equ LBUF,      EPT + 165           ; shell: line buffer, 93 trytes (92
+                                        ; chars max + NUL: a line like
+                                        ; "cp docs/notes docs/notes2" is 25
+                                        ; chars and the old 24-tryte buffer
+                                        ; silently dropped the last char);
+                                        ; ends inside reserved frame 1414
+    .equ FS_OKFLAG, EPT + 258           ; 0 = fs usable, 1 = device too small
+    .equ XFS,       EPT + 261           ; fs endpoint cap (word-aligned!)
+    .equ FS_CAP,    EPT + 264           ; fs server's own cap, parked in MEMORY
                                         ; (D-041): R6 is scratch for the format
                                         ; loop and every op handler, so the cap
                                         ; is re-read from here before each IPC
+
+; ---- M8 namespace work area (reserved frames 1417..1419, D-047) ---------------
+    .equ M8WORK,    1417 * 729          ; parked fs-op args (only the shell and
+                                        ; the boot M8 phase call these ops, so
+                                        ; fixed slots need no locking):
+                                        ; len @+0, dir flag @+3, count @+6
+    .equ M8LEN,     M8WORK
+    .equ M8DIR,     M8WORK + 3
+    .equ M8CNT,     M8WORK + 6
+    .equ NTS,       M8WORK + 12         ; name table: 48 entries x 30 trytes
+                                        ; [index word, flags word (0 free, 1
+                                        ; file, 2 dir), name <= 24 trytes
+                                        ; NUL-terminated]; linear scan
+    .equ NTE,       30                  ; name-table entry size (trytes)
+    .equ NTCNT,     48                  ; entry count (fits frames 1417+1418)
+    .equ FBUF,      1419 * 729          ; 729-tryte file-content buffer: ed/cat/
+                                        ; cp staging, name strings, LIST output,
+                                        ; TXE handoff — below RES_END, so thread
+                                        ; stacks can never take these frames
+
+; ---- M8 program region (D-046): EXEC maps TXE segments here -------------------
+    .equ PROG_BASE, 4700100             ; above the kernel trap stack (KSTACK)
+    .equ PROG_TOP,  4782969             ; exclusive RAM top (3^14 trytes)
     .equ EE_RQH,    3                   ; receiver-waiting queue head/tail
     .equ EE_RQT,    6
     .equ EE_SQH,    9                   ; sender-waiting queue head/tail
@@ -365,6 +393,14 @@ th_sys:
     BRZ R5, sys_ep_create
     CMPI3 R5, R1, 18
     BRZ R5, sys_getchar
+    CMPI3 R5, R1, 19
+    BRZ R5, sys_exec
+    CMPI3 R5, R1, 20
+    BRZ R5, sys_ps
+    CMPI3 R5, R1, 21
+    BRZ R5, sys_tstat
+    CMPI3 R5, R1, 22
+    BRZ R5, sys_kill
     const R1, str_badcall
     call puts
     JMP th_resume
@@ -924,6 +960,391 @@ sys_getchar:                         ; num 18: -> R1 = char tryte, 0 = none.
 sg_yield:
     call sched_requeue_cur
     call schedule_switch             ; never returns
+
+; ---- M8 syscalls (19..22): loader + process introspection --------------------
+
+sys_exec:                            ; frame: idx +18 (R2 = fs file index)
+    LEA R1, R8, 18
+    LDW R1, R1                       ; idx
+    call exec_load                   ; -> R1 = entry or negative status
+    CMPI3 R5, R1, 0
+    BRN R5, ex_fail
+    ; entry in R1: write it into the frame as THREAD_CREATE's fn and fall
+    ; through to the standard create path (class = 0, arg = 0). sys_create
+    ; stores the tid into the same result slot the caller reads.
+    LEA R3, R8, 18
+    STW R3, R1                       ; frame R2 slot = fn
+    LDI R1, 0
+    LEA R3, R8, 15
+    STW R3, R1                       ; class = 0
+    LEA R3, R8, 12
+    STW R3, R1                       ; arg = 0
+    JMP sys_create
+ex_fail:
+    LEA R3, R8, 21
+    STW R3, R1                       ; result = status (negative)
+    LDI R1, -1
+    LEA R3, R8, 18
+    STW R3, R1                       ; err
+    JMP th_resume
+
+exec_load:                           ; R1 = idx -> R1 = entry or -2/-3 (clobbers
+    push R7                          ; R2..R5; v0.1: single-extent, one segment)
+    ADD R3, R1, R0                   ; idx
+    push R3                          ; idx [R8]
+    ADD R1, R3, R0
+    call fs_lookup                   ; R1 = h_ref or 0 (clobbers R2..R5)
+    CMPI3 R5, R1, 0
+    BRZ R5, el_miss
+    call blk_read                    ; header -> BBUF
+    const R2, BBUF + 6
+    LDW R2, R2                       ; ext count
+    CMPI3 R5, R2, 0
+    BRZ R5, el_miss
+    const R2, BBUF + 9
+    LDW R1, R2                       ; ext[0] = data lba
+    call blk_read                    ; TXE image -> BBUF
+    ; magic 'SETUN1' (trytes 83,69,84,85,78,49)
+    const R2, BBUF
+    LDT R3, R2
+    CMPI3 R5, R3, 83
+    BRNZ R5, el_bad
+    const R2, BBUF + 1
+    LDT R3, R2
+    CMPI3 R5, R3, 69
+    BRNZ R5, el_bad
+    const R2, BBUF + 2
+    LDT R3, R2
+    CMPI3 R5, R3, 84
+    BRNZ R5, el_bad
+    const R2, BBUF + 3
+    LDT R3, R2
+    CMPI3 R5, R3, 85
+    BRNZ R5, el_bad
+    const R2, BBUF + 4
+    LDT R3, R2
+    CMPI3 R5, R3, 78
+    BRNZ R5, el_bad
+    const R2, BBUF + 5
+    LDT R3, R2
+    CMPI3 R5, R3, 49
+    BRNZ R5, el_bad
+    ; entry: word at trytes 8..10 — tryte offset 8 is NOT word-aligned, so
+    ; assemble the word from three tryte loads (a*3^12 + b*3^6 + c), as the
+    ; boot sector does for the same format (D-047)
+    const R2, BBUF + 8
+    LDT R6, R2                      ; high tryte
+    const R7, 531441                ; 3^12
+    MUL R6, R6, R7
+    LEA R2, R2, 1
+    LDT R3, R2                      ; middle tryte
+    const R7, 729                   ; 3^6
+    MUL R3, R3, R7
+    ADD R6, R6, R3
+    LEA R2, R2, 1
+    LDT R3, R2                      ; low tryte
+    ADD R3, R6, R3                  ; entry
+    const R2, PROG_BASE
+    CMP3 R5, R3, R2
+    BRN R5, el_bad
+    const R2, PROG_TOP
+    CMP3 R5, R3, R2
+    BRP R5, el_bad
+    ; park the entry BEFORE the segment checks reuse the scratch registers:
+    ; the segcount LDT and the range CMP3s would otherwise destroy it
+    ; (the original bug: the thread was created at addr+len instead — D-048)
+    push R3                          ; entry [R8]; idx -> +3, LR -> +6
+    ; one segment: addr @12, len @15, data @18 (v0.1: exactly one segment)
+    const R2, BBUF + 11
+    LDT R3, R2                       ; segment count (tryte)
+    CMPI3 R5, R3, 1
+    BRP R5, el_bad3
+    const R2, BBUF + 12
+    LDW R4, R2                       ; seg load address
+    const R2, BBUF + 15
+    LDW R5, R2                       ; seg length (trytes)
+    const R3, PROG_BASE
+    CMP3 R6, R4, R3                  ; addr < PROG_BASE -> bad (R6, so the
+    BRN R6, el_bad3                  ; length in R5 survives for the copy)
+    ADD R6, R4, R5                   ; addr + len
+    const R2, PROG_TOP
+    CMP3 R6, R6, R2
+    BRP R6, el_bad3
+    LDI R1, 0                        ; j
+el_cp:
+    CMP3 R3, R1, R5                  ; j >= len -> done
+    BRZP R3, el_done
+    const R2, BBUF + 18
+    ADD R2, R2, R1
+    LDT R3, R2                       ; tryte
+    ADD R2, R4, R1                   ; dest tryte address = addr + j
+    STT R2, R3
+    ADDI R1, R1, 1
+    JMP el_cp
+el_done:
+    pop R1                           ; entry
+    pop R2                           ; drop idx
+    pop R7                           ; LR — `ret` is JR R7, the LR must land
+    ret                              ; back in R7 (was popped into R3: wild jump)
+el_bad3:                             ; failed with the entry already parked
+    pop R2                           ; drop entry
+    JMP el_bad                       ; el_bad drops idx + LR
+el_miss:
+    LDI R1, -2                       ; no such file / empty
+    pop R2                           ; drop idx
+    pop R7                           ; LR
+    ret
+el_bad:
+    LDI R1, -3                       ; bad image / outside the program region
+    pop R2                           ; drop idx
+    pop R7                           ; LR
+    ret
+
+sys_ps:                              ; frame: buf +18, max +15
+    LEA R1, R8, 18
+    LDW R1, R1                       ; buf
+    LEA R2, R8, 15
+    LDW R2, R2                       ; max
+    call ps_fill                     ; R1 = count (stack-neutral)
+    LEA R3, R8, 21
+    STW R3, R1                       ; result = count
+    LDI R1, 0
+    LEA R3, R8, 18
+    STW R3, R1                       ; err = 0
+    JMP th_resume
+
+ps_fill:                             ; R1 = buf, R2 = max -> R1 = count; fills
+    push R7                          ; (tid, state, class) words per live thread
+    push R1                          ; buf  -> [R8+9]
+    push R2                          ; max  -> [R8+6]
+    push R0                          ; pos  -> [R8+3] = 0
+    LDI R1, 0
+    push R1                          ; tid  -> [R8+0]
+pf_loop:
+    LDW R1, R8                       ; tid
+    CMPI3 R5, R1, NT
+    BRZP R5, pf_done
+    call tcb_addr                    ; R1 = &TCB[tid] (preserves R2..R6)
+    LEA R2, R1, 9
+    LDW R3, R2                       ; state
+    CMPI3 R5, R3, -2
+    BRZ R5, pf_next
+    LEA R4, R8, 9
+    LDW R4, R4                       ; buf
+    LEA R5, R8, 3
+    LDW R5, R5                       ; pos
+    MULI R6, R5, 9
+    ADD R4, R4, R6                   ; R4 = &entry
+    LDW R6, R8                       ; tid
+    STW R4, R6                       ; entry[0] = tid
+    ADDI R4, R4, 3
+    STW R4, R3                       ; entry[1] = state
+    LEA R5, R1, 12
+    LDW R5, R5                       ; class
+    ADDI R4, R4, 3
+    STW R4, R5                       ; entry[2] = class
+    LEA R5, R8, 3
+    LDW R6, R8                       ; pos
+    ADDI R6, R6, 1
+    STW R5, R6                       ; pos++
+    LEA R5, R8, 6
+    LDW R5, R5                       ; max
+    CMP3 R5, R6, R5                  ; pos >= max -> done
+    BRZP R5, pf_done
+pf_next:
+    LDW R5, R8                       ; tid
+    ADDI R5, R5, 1
+    STW R8, R5                       ; tid++
+    JMP pf_loop
+pf_done:
+    LEA R5, R8, 3
+    LDW R1, R5                       ; count = pos
+    ADDI R8, R8, 12                  ; drop buf/max/pos/tid
+    pop R7
+    ret
+
+sys_tstat:                           ; frame: tid +18 -> R1 = state, R2 = class
+    LEA R1, R8, 18
+    LDW R1, R1                       ; tid
+    CMPI3 R5, R1, 0
+    BRN R5, ts_bad
+    CMPI3 R5, R1, NT
+    BRZP R5, ts_bad
+    call tcb_addr                    ; R1 = &TCB
+    LEA R2, R1, 9
+    LDW R3, R2                       ; state
+    CMPI3 R5, R3, -2
+    BRZ R5, ts_bad
+    LEA R2, R1, 12
+    LDW R4, R2                       ; class
+    LEA R2, R8, 21
+    STW R2, R3                       ; result R1 = state
+    LEA R2, R8, 18
+    STW R2, R4                       ; R2 = class
+    JMP th_resume
+ts_bad:
+    LDI R3, -1
+    LEA R2, R8, 21
+    STW R2, R3                       ; result = -1
+    LDI R3, -1
+    LEA R2, R8, 18
+    STW R2, R3                       ; err = -1
+    JMP th_resume
+
+sys_kill:                            ; frame: tid +18 -> 0 ok, -1 refused
+    LEA R1, R8, 18
+    LDW R1, R1                       ; tid
+    CMPI3 R5, R1, 0
+    BRN R5, kl_bad
+    CMPI3 R5, R1, NT
+    BRZP R5, kl_bad
+    const R3, CURRENT
+    LDW R3, R3
+    CMP3 R5, R1, R3
+    BRZ R5, kl_self                  ; killing yourself = a clean exit
+    push R1                          ; tid [R8]
+    call tcb_addr                    ; R1 = &TCB[tid]
+    LEA R2, R1, 9
+    LDW R3, R2                       ; state
+    CMPI3 R5, R3, 0
+    BRNZ R5, kl_badp                 ; v0.1 (D-048): only READY threads are
+                                     ; killable — a blocked thread may be
+                                     ; linked in an endpoint wait queue that
+                                     ; a free slot would corrupt
+    LEA R2, R1, 12
+    LDW R4, R2                       ; class
+    LDW R1, R8                       ; tid
+    ADD R2, R4, R0
+    call kill_unlink                 ; out of the class ready queue
+    LDW R1, R8                       ; tid
+    call kill_reap                   ; free stack + TCB slot
+    pop R1                           ; balanced
+    LDI R3, 0
+    LEA R2, R8, 21
+    STW R2, R3                       ; result = 0
+    LDI R3, 0
+    LEA R2, R8, 18
+    STW R2, R3                       ; err = 0
+    JMP th_resume
+kl_self:
+    JMP sys_exit                     ; reuse the clean self-termination path
+kl_bad:                              ; nothing parked yet
+    LDI R3, -1
+    LEA R2, R8, 21
+    STW R2, R3
+    LDI R3, -1
+    LEA R2, R8, 18
+    STW R2, R3
+    JMP th_resume
+kl_badp:                             ; tid parked: drop it first
+    pop R1
+    LDI R3, -1
+    LEA R2, R8, 21
+    STW R2, R3
+    LDI R3, -1
+    LEA R2, R8, 18
+    STW R2, R3
+    JMP th_resume
+
+kill_unlink:                         ; R1 = tid, R2 = class -> unlink from the
+    push R7                          ; class ready queue (stack-neutral;
+    push R1                          ; clobbers R1..R5; R6 = prev survives
+    push R2                          ; tcb_addr, which preserves R2..R6)
+    ADDI R3, R2, 1                   ; qidx 0..2
+    MULI R3, R3, 6
+    const R4, QHEADS
+    ADD R4, R4, R3                   ; &head[qidx]
+    LDW R3, R4                       ; head
+    LDI R6, 0                        ; prev tid
+ku_loop:
+    CMPI3 R5, R3, 0
+    BRZ R5, ku_done                  ; not linked: nothing to do
+    CMP3 R5, R3, R1
+    BRZ R5, ku_found
+    ADD R6, R3, R0                   ; prev = node
+    ADD R1, R3, R0
+    call tcb_addr                    ; R1 = &TCB[node] (preserves R2..R6)
+    LDW R3, R1                       ; next (T_NEXT @+0)
+    JMP ku_loop
+ku_found:
+    ADD R1, R3, R0
+    call tcb_addr                    ; R1 = &TCB[target]
+    LDW R2, R1                       ; next
+    CMP3 R5, R6, R0
+    BRNZ R5, ku_mid
+    STW R4, R2                       ; head = next
+    JMP ku_tail
+ku_mid:
+    ADD R1, R6, R0
+    call tcb_addr                    ; R1 = &TCB[prev]
+    STW R1, R2                       ; prev.next = next
+ku_tail:
+    LEA R3, R8, 3
+    LDW R3, R3                       ; class
+    ADDI R3, R3, 1
+    MULI R3, R3, 6
+    const R5, QHEADS
+    ADD R5, R5, R3
+    ADDI R5, R5, 3                   ; &tail[qidx]
+    LDW R3, R5                       ; tail
+    LDW R4, R8                       ; target tid
+    CMP3 R6, R3, R4
+    BRNZ R6, ku_done
+    CMP3 R6, R6, R0                  ; tail == target: tail = prev, or next
+    BRZ R6, ku_tnext                 ; when the queue drains (prev = 0)
+    ADD R3, R6, R0
+    STW R5, R3                       ; tail = prev
+    JMP ku_done
+ku_tnext:
+    STW R5, R2                       ; tail = next (0 when the queue drained)
+ku_done:
+    pop R2
+    pop R1
+    pop R7
+    ret
+
+kill_reap:                           ; R1 = tid -> free stack + TCB slot
+    push R2                          ; (generalized sys_exit_body reaping;
+    push R3                          ; stack-neutral; clobbers R2..R6)
+    push R4
+    push R5
+    push R6
+    push R7
+    ADD R6, R1, R0                   ; tid
+    call tcb_addr                    ; R1 = &TCB[tid]
+    LEA R2, R1, 21
+    LDW R3, R2                       ; flags
+    CMPI3 R5, R3, 0
+    BRP R5, kr_nofree                ; static stack (idle/main): keep it
+    LEA R2, R1, 18
+    LDW R1, R2                       ; stack frame base PA
+    LDI R2, 729
+    DIV R1, R1, R2                   ; frame index
+    ADDI R1, R1, 3281                ; leaf node id
+    ADD R2, R1, R0                   ; R2 = node (buddy_free takes R1 = depth!)
+    LDI R1, 8
+    call buddy_free
+    ADD R1, R6, R0
+    call tcb_addr
+    JMP kr_tcb
+kr_nofree:
+    ADD R1, R6, R0
+    call tcb_addr
+kr_tcb:
+    const R2, FREE_TID
+    LDW R3, R2                       ; old free-list head
+    STW R1, R3                       ; TCB[tid].next = old head
+    LDI R3, -2
+    LEA R4, R1, 9
+    STW R4, R3                       ; state = free slot
+    STW R2, R6                       ; FREE_TID = tid
+    pop R7
+    pop R6
+    pop R5
+    pop R4
+    pop R3
+    pop R2
+    ret
 
 sys_cap_derive:                      ; frame: parent +18, requested rights +15
     LEA R1, R8, 18
@@ -1862,17 +2283,29 @@ sys_create_body:                     ; R1 = fn, R2 = class, R3 = arg
     ADD R6, R2, R0                   ; class
     push R3                          ; arg      (old SP - 3)
     push R7                          ; LR       (old SP - 6)
-    ; validate the arguments: fn must point into the kernel text segment,
-    ; class must be a trit (-1/0/+1); anything else is a clean error
+    ; validate the arguments: fn must point into the kernel text segment OR
+    ; the M8 program region (EXEC-loaded TXE image, D-046); class must be a
+    ; trit (-1/0/+1); anything else is a clean error
     CMPI3 R3, R5, KERNEL_LOAD
     BRN R3, scr_fail
     const R2, STRBASE
     CMP3 R3, R5, R2
-    BRZP R3, scr_fail
+    BRZP R3, scr_prog                ; above the text segment: maybe the prog
+                                     ; region — check, else fail
+scr_class:
     CMPI3 R3, R6, -1
     BRN R3, scr_fail
     CMPI3 R3, R6, 1
     BRP R3, scr_fail
+    JMP scr_go
+scr_prog:
+    const R2, PROG_BASE
+    CMP3 R3, R5, R2
+    BRN R3, scr_fail
+    const R2, PROG_TOP
+    CMP3 R3, R5, R2
+    BRP R3, scr_fail
+scr_go:
     const R1, FREE_TID
     LDW R1, R1                       ; free slot (0 = exhausted)
     CMPI3 R3, R1, 0
@@ -2323,6 +2756,29 @@ srv_loop:
     TRAP 0
     JMP srv_loop
 
+pipe_writer:                         ; R1 = pipe cap: SEND the demo line, exit.
+                                     ; The shell RECVs it — the endpoint is the
+                                     ; v0.1 pipe (one message in flight).
+    ADD R6, R1, R0                   ; cap (survives SEND/RECV traps)
+    const R5, str_pipedata
+pwp_loop:
+    LDT R3, R5                       ; char
+    BRZ R3, pwp_nl
+    ADD R1, R3, R0                   ; msg1 = char
+    ADD R2, R6, R0                   ; cap
+    LDI R1, 8                        ; SEND
+    TRAP 0
+    ADDI R5, R5, 1
+    JMP pwp_loop
+pwp_nl:
+    LDI R3, 10                       ; newline
+    ADD R1, R3, R0
+    ADD R2, R6, R0
+    LDI R1, 8                        ; SEND
+    TRAP 0
+    LDI R1, 2                        ; EXIT
+    TRAP 0
+
 ; ------------------------------------------------------------------------------
 ; shell_main — M6 interactive shell (a normal user thread). Prints a prompt,
 ; reads a line through GETCHAR (yield-poll inside the syscall), then runs the
@@ -2350,7 +2806,7 @@ sh_read:
     BRZ R5, sh_exec
     const R2, LLEN
     LDW R3, R2                       ; len
-    CMPI3 R5, R3, 24
+    CMPI3 R5, R3, 92
     BRZP R5, sh_read                 ; buffer full: swallow the tail
     const R4, LBUF
     ADD R4, R4, R3                   ; &LBUF[len] (tryte addressing)
@@ -2386,6 +2842,62 @@ sh_exec:
     call str_eq
     CMPI3 R5, R3, 1
     BRZ R5, sh_halt
+    ; ---- M8 coreutils dispatch ----
+    const R1, LBUF
+    const R2, str_cmd_ls
+    call str_eq
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_ls
+    const R1, LBUF
+    const R2, str_cmd_ps
+    call str_eq
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_ps
+    const R1, LBUF
+    const R2, str_cmd_pipe
+    call str_eq
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_pipe
+    const R1, LBUF
+    const R2, str_cmd_cat
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_cat
+    const R1, LBUF
+    const R2, str_cmd_ed
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_ed
+    const R1, LBUF
+    const R2, str_cmd_rm
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_rm
+    const R1, LBUF
+    const R2, str_cmd_cp
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_cp
+    const R1, LBUF
+    const R2, str_cmd_mkdir
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_mkdir
+    const R1, LBUF
+    const R2, str_cmd_tstat
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_tstat
+    const R1, LBUF
+    const R2, str_cmd_kill
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_kill
+    const R1, LBUF
+    const R2, str_cmd_exec
+    call sh_pfx
+    CMPI3 R5, R3, 1
+    BRZ R5, sh_execprog
     ; "echo " prefix? (5 trytes must match exactly)
     const R1, LBUF
     const R2, str_cmd_echo
@@ -2462,6 +2974,677 @@ sh_halt:
     const R1, POWER
     LDI R2, 1
     STW R1, R2                       ; power off
+    JMP sh_loop
+
+; ---- M8 coreutils (D-047) -----------------------------------------------------
+
+sh_pfx:                              ; R1 = line, R2 = prefix -> R3 = 1 if the
+    push R7                          ; line starts with prefix AND continues
+    push R1                          ; with a space; R4 = arg tryte offset
+    push R2                          ; (clobbers R1, R2, R4..R6)
+    LDI R5, 0                        ; i
+spx_loop:
+    ADD R3, R1, R5
+    LDT R4, R3                       ; line[i]
+    ADD R3, R2, R5
+    LDT R6, R3                       ; prefix[i]
+    BRZ R6, spx_end                  ; prefix consumed
+    CMP3 R6, R4, R6
+    BRNZ R6, spx_no
+    ADDI R5, R5, 1
+    JMP spx_loop
+spx_end:
+    ADD R1, R1, R5
+    LDT R6, R1                       ; line[len]
+    CMPI3 R4, R6, 32                 ; a space must follow (R4 is free here;
+    BRNZ R4, spx_no                  ; R5 still holds the prefix length)
+    ADDI R4, R5, 1                   ; arg offset = len + 1
+    pop R2
+    pop R1
+    LDI R3, 1
+    pop R7
+    ret
+spx_no:
+    pop R2
+    pop R1
+    LDI R3, 0
+    pop R7
+    ret
+
+sh_argcpy:                           ; R4 = arg offset -> FBUF = token (NUL-
+    LDI R2, 0                        ; terminated; stops at space; clobbers
+    ; j                              ; R1..R3, R5; keeps R4)
+sac_loop:
+    const R3, LBUF
+    ADD R3, R3, R4
+    ADD R3, R3, R2
+    LDT R1, R3                       ; line[arg + j]
+    BRZ R1, sac_end
+    CMPI3 R5, R1, 32
+    BRZ R5, sac_end
+    const R3, FBUF
+    ADD R3, R3, R2
+    STT R3, R1
+    ADDI R2, R2, 1
+    JMP sac_loop
+sac_end:
+    const R3, FBUF
+    ADD R3, R3, R2
+    LDI R1, 0
+    STT R3, R1
+    ret
+
+sh_atoi:                             ; FBUF token -> R3 = value (-1 on garbage;
+    LDI R3, 0                        ; clobbers R1..R5)
+    LDI R2, 0                        ; j
+sao_loop:
+    const R4, FBUF
+    ADD R4, R4, R2
+    LDT R1, R4                       ; c
+    BRZ R1, sao_done
+    CMPI3 R5, R1, 32
+    BRZ R5, sao_done
+    CMPI3 R5, R1, 48
+    BRN R5, sao_bad
+    CMPI3 R5, R1, 57
+    BRP R5, sao_bad
+    ADDI R5, R1, -48                 ; digit
+    MULI R3, R3, 10
+    ADD R3, R3, R5
+    ADDI R2, R2, 1
+    JMP sao_loop
+sao_done:
+    ret
+sao_bad:
+    LDI R3, -1
+    ret
+
+sh_freeidx:                          ; -> R1 = first missing slot index or -1
+    push R7                          ; (probes the fs server with CHECK)
+    LDI R1, 0
+    push R1                          ; i [R8]
+sfi_loop:
+    LDW R2, R8
+    CMPI3 R5, R2, 1000
+    BRZP R5, sfi_none
+    const R3, XFS
+    LDW R2, R3                       ; cap re-read per call (D-041)
+    LDW R4, R8                       ; i
+    LDI R3, 2                        ; CHECK
+    LDI R1, 10                       ; CALL
+    TRAP 0                           ; R3 = 0 ok / -1 bad / -2 missing
+    CMPI3 R5, R3, -2
+    BRZ R5, sfi_found
+    LDW R1, R8
+    ADDI R1, R1, 1
+    STW R8, R1                       ; i++
+    JMP sfi_loop
+sfi_found:
+    pop R1                           ; i
+    pop R7
+    ret
+sfi_none:
+    LDI R1, -1
+    pop R2                           ; drop i (R1 keeps the result)
+    pop R7
+    ret
+
+sh_ls:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 10                       ; LIST
+    LDI R4, 0
+    LDI R1, 10                       ; CALL
+    TRAP 0                           ; R3 = trytes written into FBUF
+    CMPI3 R5, R3, 0
+    BRN R5, sh_lserr
+    push R3                          ; len
+    LDI R4, 0                        ; j
+sh_lspr:
+    LDW R2, R8
+    CMP3 R5, R4, R2
+    BRZP R5, sh_lsd
+    const R2, FBUF
+    ADD R2, R2, R4
+    LDT R1, R2
+    call putc
+    ADDI R4, R4, 1
+    JMP sh_lspr
+sh_lsd:
+    pop R1
+    JMP sh_loop
+sh_lserr:
+    const R1, str_fserr
+    call puts
+    JMP sh_loop
+
+sh_ps:
+    const R2, FBUF
+    LDI R3, 27                       ; max entries
+    LDI R1, 20                       ; PS
+    TRAP 0                           ; R1 = count
+    CMPI3 R5, R1, 0
+    BRN R5, sh_pserr
+    push R1                          ; count [R8]
+    LDI R6, 0                        ; e (putnum/putc preserve R6)
+sh_psl:
+    LDW R2, R8
+    CMP3 R5, R6, R2
+    BRZP R5, sh_psd
+    MULI R2, R6, 9
+    const R3, FBUF
+    ADD R3, R3, R2
+    LDW R1, R3                       ; tid
+    call putnum
+    LDI R1, 32
+    call putc
+    MULI R2, R6, 9
+    const R3, FBUF
+    ADD R3, R3, R2
+    ADDI R3, R3, 3
+    LDW R1, R3                       ; state
+    call putnum
+    LDI R1, 32
+    call putc
+    MULI R2, R6, 9
+    const R3, FBUF
+    ADD R3, R3, R2
+    ADDI R3, R3, 6
+    LDW R1, R3                       ; class
+    call putnum
+    LDI R1, 10
+    call putc
+    ADDI R6, R6, 1
+    JMP sh_psl
+sh_psd:
+    pop R1
+    JMP sh_loop
+sh_pserr:
+    const R1, str_pserr
+    call puts
+    JMP sh_loop
+
+sh_cat:
+    ADD R1, R4, R0                   ; arg offset
+    call sh_argcpy                   ; FBUF = name
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0                           ; R3 = index or -1, R4 = flags
+    CMPI3 R5, R3, 0
+    BRN R5, sh_noent
+    ADD R4, R3, R0                   ; index
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 6                        ; READ
+    LDI R1, 10
+    TRAP 0                           ; R3 = trytes in FBUF
+    CMPI3 R5, R3, 0
+    BRN R5, sh_caterr
+    push R3                          ; len
+    LDI R4, 0                        ; j
+sh_catp:
+    LDW R2, R8
+    CMP3 R5, R4, R2
+    BRZP R5, sh_catd
+    const R2, FBUF
+    ADD R2, R2, R4
+    LDT R1, R2
+    call putc
+    ADDI R4, R4, 1
+    JMP sh_catp
+sh_catd:
+    pop R1
+    LDI R1, 10
+    call putc
+    JMP sh_loop
+sh_caterr:
+    const R1, str_fserr
+    call puts
+    JMP sh_loop
+sh_noent:
+    const R1, str_noent
+    call puts
+    JMP sh_loop
+
+sh_ed:
+    ADD R1, R4, R0                   ; arg offset
+    call sh_argcpy                   ; FBUF = name
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0                           ; R3 = index or -1
+    CMPI3 R5, R3, 0
+    BRP R5, sh_edhave
+    call sh_freeidx                  ; R1 = free index or -1
+    CMPI3 R5, R1, 0
+    BRN R5, sh_ederr                 ; nothing parked yet
+    ADD R4, R1, R0                   ; idx
+    push R4                          ; idx [R8]
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 1                        ; CREATE
+    LDI R1, 10
+    TRAP 0                           ; R3 = 0 (payload pattern written)
+    CMPI3 R5, R3, 0
+    BRN R5, sh_ederr
+    const R3, M8DIR
+    LDI R2, 0
+    STW R3, R2                       ; file flag
+    LEA R3, R8, 0
+    LDW R4, R3                       ; idx
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 8                        ; NAMESET
+    LDI R1, 10
+    TRAP 0                           ; name still in FBUF
+    CMPI3 R5, R3, 0
+    BRN R5, sh_ederr
+    JMP sh_edlines
+sh_edhave:
+    ADD R4, R3, R0                   ; idx (existing file)
+    push R4                          ; idx [R8]
+sh_edlines:
+    const R3, M8CNT
+    LDI R2, 0
+    STW R3, R2                       ; content pos = 0
+sh_edline:                           ; read one line into LBUF (sh_read pattern)
+    const R3, LLEN
+    LDI R2, 0
+    STW R3, R2
+sh_edrc:
+    LDI R1, 18                       ; GETCHAR
+    TRAP 0
+    BRZ R1, sh_edrc
+    ADD R3, R1, R0
+    call putc                        ; echo the keystroke
+    CMPI3 R5, R1, 10                 ; newline ends the line
+    BRZ R5, sh_edln
+    const R3, LLEN
+    LDW R4, R3
+    CMPI3 R5, R4, 92
+    BRZP R5, sh_edrc                 ; buffer full: swallow the tail
+    const R2, LBUF
+    ADD R2, R2, R4
+    STT R2, R1
+    ADDI R4, R4, 1
+    STW R3, R4
+    JMP sh_edrc
+sh_edln:
+    const R3, LLEN
+    LDW R4, R3
+    const R2, LBUF
+    ADD R2, R2, R4
+    LDI R6, 0
+    STT R2, R6                       ; NUL-terminate
+    const R3, LLEN
+    LDW R4, R3
+    CMPI3 R5, R4, 1
+    BRNZ R5, sh_edapp
+    const R2, LBUF
+    LDT R6, R2                       ; lone '.' ends the input
+    CMPI3 R5, R6, 46
+    BRZ R5, sh_edfin
+sh_edapp:
+    const R3, M8CNT
+    LDW R2, R3
+    CMPI3 R5, R2, 729
+    BRZP R5, sh_edskip               ; content buffer full: consume only
+    LDI R4, 0                        ; j
+sh_edap:
+    const R3, LLEN
+    LDW R2, R3
+    CMP3 R5, R4, R2
+    BRZP R5, sh_edanl
+    const R6, LBUF
+    ADD R6, R6, R4
+    LDT R1, R6                       ; char
+    const R3, M8CNT
+    LDW R2, R3                       ; pos
+    const R6, FBUF
+    ADD R6, R6, R2
+    STT R6, R1
+    ADDI R2, R2, 1
+    const R3, M8CNT
+    STW R3, R2                       ; pos++
+    ADDI R4, R4, 1
+    JMP sh_edap
+sh_edanl:
+    const R3, M8CNT
+    LDW R2, R3                       ; pos
+    LDI R1, 10                       ; newline
+    const R6, FBUF
+    ADD R6, R6, R2
+    STT R6, R1
+    ADDI R2, R2, 1
+    const R3, M8CNT
+    STW R3, R2
+sh_edskip:
+    JMP sh_edline
+sh_edfin:
+    const R3, M8CNT
+    LDW R2, R3
+    const R3, M8LEN
+    STW R3, R2                       ; M8LEN = content length
+    LEA R3, R8, 0
+    LDW R4, R3                       ; idx
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 7                        ; WRITE
+    LDI R1, 10
+    TRAP 0                           ; R3 = status
+    CMPI3 R5, R3, 0
+    BRN R5, sh_ederr
+    pop R1                           ; balanced
+    const R1, str_edok
+    call puts
+    JMP sh_loop
+sh_ederr:
+    pop R1                           ; drop idx (if parked)
+    const R1, str_fserr
+    call puts
+    JMP sh_loop
+
+sh_rm:
+    ADD R1, R4, R0                   ; arg offset
+    call sh_argcpy                   ; FBUF = name
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R5, R3, 0
+    BRN R5, sh_noent
+    ADD R4, R3, R0                   ; idx
+    push R4                          ; idx [R8]
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 11                       ; NAMECLEAR
+    LDI R1, 10
+    TRAP 0
+    LDW R4, R8                       ; idx
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 3                        ; DELETE
+    LDI R1, 10
+    TRAP 0                           ; R3 = status
+    CMPI3 R5, R3, 0
+    BRN R5, sh_rmerr
+    pop R1
+    const R1, str_rmok
+    call puts
+    JMP sh_loop
+sh_rmerr:
+    pop R1
+    const R1, str_fserr
+    call puts
+    JMP sh_loop
+
+sh_cp:
+    push R4                          ; src arg offset [R8] — CALL replies
+                                     ; overwrite R4 with msg2 (D-041), so the
+                                     ; offset must live on the stack
+    ADD R1, R4, R0
+    call sh_argcpy                   ; FBUF = src name
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0                           ; R3 = idxA or -1 (R4 clobbered)
+    CMPI3 R5, R3, 0
+    BRN R5, scp_noent
+    ADD R4, R3, R0                   ; idxA
+    push R4                          ; idxA -> [R8], src offset -> +3
+    LEA R4, R8, 3
+    LDW R4, R4                       ; src arg offset (reloaded)
+    LDI R5, 0                        ; j
+scp_sp:
+    const R3, LBUF
+    ADD R3, R3, R4
+    ADD R3, R3, R5
+    LDT R1, R3
+    BRZ R1, scp_noarg
+    CMPI3 R6, R1, 32
+    BRZ R6, scp_spf
+    ADDI R5, R5, 1
+    JMP scp_sp
+scp_spf:
+    ADD R4, R4, R5
+    ADDI R4, R4, 1                   ; dst arg offset
+    pop R1                           ; idxA (temp: R1 is free until the push)
+    pop R2                           ; drop the src offset
+    push R1                          ; idxA back -> [R8]
+    ADD R1, R4, R0
+    call sh_argcpy                   ; FBUF = dst name
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0                           ; R3 = idxB or -1
+    CMPI3 R5, R3, 0
+    BRP R5, scp_havetgt
+    call sh_freeidx                  ; new target: first missing slot
+    CMPI3 R5, R1, 0
+    BRN R5, scp_noidx                ; stack: idxA parked only
+    ADD R4, R1, R0                   ; idxB
+    push R4                          ; [R8]=idxB, idxA -> +3
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 1                        ; CREATE
+    LEA R4, R8, 0
+    LDW R4, R4                       ; idxB
+    LDI R1, 10
+    TRAP 0                           ; payload pattern at idxB
+    CMPI3 R5, R3, 0
+    BRN R5, scp_err
+    const R3, M8DIR
+    LDI R2, 0
+    STW R3, R2                       ; file flag
+    LEA R3, R8, 0
+    LDW R4, R3                       ; idxB
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 8                        ; NAMESET (dst name still in FBUF)
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R5, R3, 0
+    BRN R5, scp_err
+    JMP scp_copy
+scp_havetgt:
+    ADD R4, R3, R0                   ; idxB
+    push R4                          ; [R8]=idxB, idxA -> +3
+scp_copy:
+    ; NOTE: at this point [R8] = idxB and +3 = idxA
+    LEA R3, R8, 3
+    LDW R4, R3                       ; idxA
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 6                        ; READ -> FBUF
+    LDI R1, 10
+    TRAP 0                           ; R3 = trytes read into FBUF
+    CMPI3 R5, R3, 0
+    BRN R5, scp_err
+    const R2, M8LEN
+    STW R2, R3                       ; M8LEN = len
+    LEA R3, R8, 0
+    LDW R4, R3                       ; idxB
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 7                        ; WRITE
+    LDI R1, 10
+    TRAP 0                           ; R3 = status
+    CMPI3 R5, R3, 0
+    BRN R5, scp_err
+    pop R2                           ; idxB
+    pop R2                           ; idxA
+    const R1, str_cpok
+    call puts
+    JMP sh_loop
+scp_err:
+    pop R2                           ; idxB
+    pop R2                           ; idxA
+    const R1, str_fserr
+    call puts
+    JMP sh_loop
+scp_noidx:
+    pop R2                           ; idxA
+    const R1, str_fserr
+    call puts
+    JMP sh_loop
+scp_noarg:
+    pop R2                           ; idxA
+    pop R2                           ; src offset
+    const R1, str_usage
+    call puts
+    JMP sh_loop
+scp_noent:
+    pop R4                           ; src offset
+    JMP sh_noent
+
+sh_mkdir:
+    ADD R1, R4, R0                   ; arg offset
+    call sh_argcpy                   ; FBUF = name
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R5, R3, 0
+    BRP R5, sh_mkexists
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 12                       ; MKDIR
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0                           ; R3 = status
+    CMPI3 R5, R3, 0
+    BRN R5, sh_mkerr
+    const R1, str_mkok
+    call puts
+    JMP sh_loop
+sh_mkexists:
+    const R1, str_exists
+    call puts
+    JMP sh_loop
+sh_mkerr:
+    const R1, str_fserr
+    call puts
+    JMP sh_loop
+
+sh_tstat:
+    ADD R1, R4, R0                   ; arg offset
+    call sh_argcpy                   ; FBUF = digits
+    call sh_atoi                     ; R3 = tid
+    CMPI3 R5, R3, 0
+    BRN R5, sh_tsbad
+    ADD R2, R3, R0                   ; R2 = tid
+    LDI R1, 21                       ; TSTAT
+    TRAP 0                           ; R1 = state, R2 = class
+    CMPI3 R5, R1, -1
+    BRZ R5, sh_tsbad
+    ADD R6, R2, R0                   ; class (putnum/putc keep R6)
+    call putnum                      ; state
+    LDI R1, 32
+    call putc
+    ADD R1, R6, R0
+    call putnum                      ; class
+    LDI R1, 10
+    call putc
+    JMP sh_loop
+sh_tsbad:
+    const R1, str_nothread
+    call puts
+    JMP sh_loop
+
+sh_kill:
+    ADD R1, R4, R0                   ; arg offset
+    call sh_argcpy
+    call sh_atoi                     ; R3 = tid
+    CMPI3 R5, R3, 0
+    BRN R5, sh_tsbad
+    ADD R2, R3, R0                   ; R2 = tid
+    LDI R1, 22                       ; KILL
+    TRAP 0                           ; R1 = 0 ok / -1 refused
+    CMPI3 R5, R1, 0
+    BRN R5, sh_killbad
+    const R1, str_killok
+    call puts
+    JMP sh_loop
+sh_killbad:
+    const R1, str_killbad
+    call puts
+    JMP sh_loop
+
+sh_execprog:
+    ADD R1, R4, R0                   ; arg offset
+    call sh_argcpy                   ; FBUF = name
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0                           ; R3 = idx or -1
+    CMPI3 R5, R3, 0
+    BRN R5, sh_noent
+    ADD R2, R3, R0                   ; R2 = idx
+    LDI R1, 19                       ; EXEC
+    TRAP 0                           ; R1 = tid or negative
+    CMPI3 R5, R1, 0
+    BRN R5, sh_execerr
+    push R1                          ; tid
+    const R1, str_exectid
+    call puts
+    pop R1
+    call putnum
+    LDI R1, 10
+    call putc
+    JMP sh_loop
+sh_execerr:
+    const R1, str_execerr
+    call puts
+    JMP sh_loop
+
+sh_pipe:                             ; demo: an endpoint as a 1-slot pipe
+    LDI R2, 1                        ; badge
+    LDI R1, 17                       ; EP_CREATE
+    TRAP 0                           ; R1 = cap ref or negative
+    CMPI3 R5, R1, 0
+    BRN R5, sh_pipeerr
+    push R1                          ; cap [R8]
+    const R2, pipe_writer
+    LDW R4, R8                       ; arg = cap
+    LDI R3, 0                        ; class
+    LDI R1, 3                        ; THREAD_CREATE
+    TRAP 0                           ; R1 = tid
+    CMPI3 R5, R1, 0
+    BRN R5, sh_pipeerr2
+    LDI R1, 1                        ; YIELD: let the writer reach its SEND
+    TRAP 0
+sh_piperd:
+    LDW R2, R8                       ; cap (re-read per call, D-041)
+    LDI R1, 9                        ; RECV
+    TRAP 0                           ; R3 = tryte
+    CMPI3 R5, R3, -1
+    BRZ R5, sh_pipeerr2
+    ADD R1, R3, R0
+    call putc
+    CMPI3 R5, R3, 10                 ; newline ends the message
+    BRNZ R5, sh_piperd
+    pop R1
+    JMP sh_loop
+sh_pipeerr2:
+    pop R1
+sh_pipeerr:
+    const R1, str_pipeerr
+    call puts
     JMP sh_loop
 
 str_eq:                              ; R1 = &a, R2 = &b (tryte strings, NUL
@@ -2980,6 +4163,20 @@ fsm_loop:
     BRZ R1, fsop_status
     CMPI3 R1, R3, 5
     BRZ R1, fsop_fsck
+    CMPI3 R1, R3, 6
+    BRZ R1, fsop_read
+    CMPI3 R1, R3, 7
+    BRZ R1, fsop_write
+    CMPI3 R1, R3, 8
+    BRZ R1, fsop_nameset
+    CMPI3 R1, R3, 9
+    BRZ R1, fsop_nameget
+    CMPI3 R1, R3, 10
+    BRZ R1, fsop_list
+    CMPI3 R1, R3, 11
+    BRZ R1, fsop_nameclr
+    CMPI3 R1, R3, 12
+    BRZ R1, fsop_mkdir
     LDI R3, -4                       ; unknown op
     LDI R4, 0
     JMP fsm_reply
@@ -3179,6 +4376,431 @@ fsm_reply:
     LDW R2, R2                       ; cap re-read per call (D-041)
     TRAP 0                           ; msg1 = R3, msg2 = R4
     JMP fsm_loop
+
+; ---- M8 namespace ops (D-047): the caller parks extra arguments in fixed
+; memory slots (M8LEN/M8DIR/M8CNT) and strings/content in FBUF — only the
+; shell and the boot M8 phase use these ops, so no locking is needed.
+
+fsop_read:                           ; op 6: READ(i) -> FBUF; msg1 = trytes
+    ADD R1, R4, R0                   ; i
+    call fs_lookup                   ; R1 = h_ref or 0 (clobbers R2..R5)
+    CMPI3 R5, R1, 0
+    BRZ R5, fr_miss
+    call blk_read                    ; header -> BBUF
+    const R2, BBUF + 6
+    LDW R3, R2                       ; ext count
+    CMPI3 R5, R3, 0
+    BRZ R5, fr_empty
+    const R2, BBUF
+    LDW R3, R2                       ; len
+    push R3                          ; len (the blk_read below clobbers R2/R3)
+    const R2, BBUF + 9
+    LDW R1, R2                       ; ext[0] = data lba
+    call blk_read                    ; data -> BBUF
+    pop R3                           ; len
+    LDI R4, 0                        ; j
+fr_copy:
+    CMP3 R5, R4, R3                  ; j >= len -> done
+    BRZP R5, fr_clamp
+    const R2, BBUF
+    ADD R2, R2, R4
+    LDT R1, R2                       ; data tryte
+    const R2, FBUF
+    ADD R2, R2, R4
+    STT R2, R1
+    ADDI R4, R4, 1
+    JMP fr_copy
+fr_clamp:
+    CMPI3 R5, R3, 729
+    BRN R5, fr_ok
+    LDI R3, 729                      ; single-extent clamp (v0.1)
+fr_ok:
+    ADD R1, R3, R0                   ; msg1 = trytes copied
+    LDI R4, 0
+    JMP fsm_reply
+fr_empty:
+    LDI R3, 0                        ; empty file: zero trytes
+    LDI R4, 0
+    JMP fsm_reply
+fr_miss:
+    LDI R3, -2                       ; missing
+    LDI R4, 0
+    JMP fsm_reply
+
+fsop_write:                          ; op 7: WRITE(i) <- FBUF, len = M8LEN
+    const R2, M8LEN
+    LDW R3, R2
+    CMPI3 R5, R3, 0
+    BRN R5, fw_badlen
+    CMPI3 R5, R3, 729
+    BRP R5, fw_badlen
+    ADD R1, R4, R0                   ; i
+    call fs_lookup                   ; R1 = h_ref or 0
+    CMPI3 R5, R1, 0
+    BRZ R5, fw_miss
+    ADD R4, R1, R0                   ; h_ref
+    push R4                          ; h_ref (free_alloc clobbers R2..R5)
+    ADD R1, R4, R0
+    call blk_read                    ; header -> BBUF
+    const R2, BBUF + 6
+    LDW R2, R2                       ; ext count
+    CMPI3 R5, R2, 0
+    BRNZ R5, fw_have
+    call free_alloc                  ; R1 = new data lba (IO on BB2: the
+                                     ; staged header in BBUF is intact)
+    CMPI3 R5, R1, 0
+    BRN R5, fw_enomem
+    push R1                          ; dref -> [R8], h_ref -> +3
+    LDI R1, 1
+    push R1                          ; newext -> [R8], dref +3, h_ref +6
+    JMP fw_fill
+fw_have:
+    const R2, BBUF + 9
+    LDW R1, R2                       ; ext[0] = dref
+    push R1                          ; dref -> [R8], h_ref -> +3
+    LDI R1, 0
+    push R1                          ; newext -> [R8], dref +3, h_ref +6
+fw_fill:                             ; stack: newext [R8], dref [+3], h_ref [+6]
+    LDI R1, 0                        ; j
+fw_cp:
+    const R2, M8LEN
+    LDW R3, R2                       ; len
+    CMP3 R5, R1, R3                  ; j >= len -> pad the rest with zeros
+    BRZP R5, fw_pad
+    const R4, FBUF
+    ADD R4, R4, R1
+    LDT R5, R4                       ; content tryte
+    const R4, BBUF
+    ADD R4, R4, R1
+    STT R4, R5
+    ADDI R1, R1, 1
+    JMP fw_cp
+fw_pad:
+    const R4, BBUF
+    ADD R4, R4, R1
+    LDI R5, 0
+    STT R4, R5
+    ADDI R1, R1, 1
+    CMPI3 R5, R1, 729
+    BRN R5, fw_pad
+    const R1, BBUF
+    call sum_calc                    ; R1 = sum over all 729 trytes (clobbers
+    ADD R5, R1, R0                   ; R2..R5; R5 = sum survives the IO below)
+    LEA R1, R8, 3
+    LDW R1, R1                       ; dref
+    call blk_write                   ; data block <- BBUF
+    LEA R1, R8, 6
+    LDW R1, R1                       ; h_ref
+    call blk_read                    ; header -> BBUF (fresh copy to patch)
+    const R2, M8LEN
+    LDW R3, R2                       ; len
+    const R4, BBUF
+    STW R4, R3                       ; [BBUF+0] = len
+    const R4, BBUF + 3
+    STW R4, R5                       ; [BBUF+3] = sum
+    LDI R3, 1
+    const R4, BBUF + 6
+    STW R4, R3                       ; [BBUF+6] = ext_count 1
+    LDW R3, R8                       ; newext
+    CMPI3 R5, R3, 0
+    BRZ R5, fw_nodref
+    LEA R2, R8, 3
+    LDW R3, R2                       ; dref
+    const R4, BBUF + 9
+    STW R4, R3                       ; [BBUF+9] = ext[0] = dref
+fw_nodref:
+    LEA R1, R8, 6
+    LDW R1, R1                       ; h_ref
+    call blk_write                   ; header <- BBUF (the commit point)
+    ADDI R8, R8, 9                   ; drop newext/dref/h_ref
+    LDI R3, 0
+    LDI R4, 0
+    JMP fsm_reply
+fw_badlen:
+    LDI R3, -3                       ; len out of range (0..729)
+    LDI R4, 0
+    JMP fsm_reply
+fw_miss:
+    LDI R3, -2                       ; missing
+    LDI R4, 0
+    JMP fsm_reply
+fw_enomem:
+    ADDI R8, R8, 3                   ; drop the parked h_ref
+    LDI R3, -3                       ; disk full
+    LDI R4, 0
+    JMP fsm_reply
+
+fsop_nameset:                        ; op 8: NAMESET(i) — name in FBUF,
+    push R4                          ; dir flag in M8DIR (0 file, nonzero dir);
+    ADD R1, R4, R0                   ; i parked at [R8] (the scan reloads it)
+    const R2, NTS
+    ADD R4, R2, R0                   ; entry ptr
+    LDI R3, 0                        ; update target (entry with same index)
+    LDI R1, 0                        ; first free entry
+fn_scan:
+    LDW R6, R4                       ; entry index
+    LDW R2, R8                       ; i
+    CMP3 R6, R6, R2
+    BRNZ R6, fn_notmatch
+    ADD R3, R4, R0                   ; update in place
+    JMP fn_scanend
+fn_notmatch:
+    LEA R6, R4, 3
+    LDW R6, R6                       ; flags
+    CMPI3 R5, R6, 0
+    BRNZ R5, fn_next
+    CMPI3 R5, R1, 0
+    BRNZ R5, fn_next
+    ADD R1, R4, R0                   ; remember the first free slot
+fn_next:
+    ADDI R4, R4, NTE
+    const R2, NTS
+    ADDI R2, R2, NTCNT * NTE
+    CMP3 R6, R4, R2
+    BRN R6, fn_scan
+fn_scanend:
+    CMPI3 R5, R3, 0
+    BRNZ R5, fn_tgt                  ; update an existing entry in place
+    CMPI3 R5, R1, 0
+    BRZ R5, fn_full                  ; no match and no free entry -> full
+    ADD R4, R1, R0                   ; new entry: target = first free entry
+    JMP fn_set
+fn_tgt:
+    ADD R4, R3, R0                   ; target = the matching entry
+fn_set:
+    pop R1                           ; i
+    STW R4, R1                       ; [entry+0] = index
+    const R2, M8DIR
+    LDW R3, R2
+    CMPI3 R5, R3, 0
+    BRZ R5, fn_file
+    LDI R3, 2
+    JMP fn_flag
+fn_file:
+    LDI R3, 1
+fn_flag:
+    LEA R5, R4, 3
+    STW R5, R3                       ; [entry+3] = flags (1 file, 2 dir)
+    LDI R3, 0                        ; j
+fn_ncopy:
+    CMPI3 R5, R3, 23
+    BRZP R5, fn_nterm                ; cap the name at 23 trytes
+    const R5, FBUF
+    ADD R5, R5, R3
+    LDT R6, R5                       ; name[j]
+    BRZ R6, fn_nterm                 ; NUL ends the copy
+    LEA R5, R4, 6
+    ADD R5, R5, R3
+    STT R5, R6                       ; entry.name[j]
+    ADDI R3, R3, 1
+    JMP fn_ncopy
+fn_nterm:
+    LEA R5, R4, 6
+    ADD R5, R5, R3
+    LDI R6, 0
+    STT R5, R6                       ; NUL-terminate
+    LDI R3, 0
+    LDI R4, 0
+    JMP fsm_reply
+fn_full:
+    pop R1                           ; balanced
+    LDI R3, -3                       ; name table full
+    LDI R4, 0
+    JMP fsm_reply
+
+fsop_nameget:                        ; op 9: name in FBUF -> msg1 = index,
+    const R2, NTS                    ; msg2 = flags (1 file, 2 dir), -1 if none
+    ADD R1, R2, R0
+    push R1                          ; entry ptr (str_eq clobbers R1/R2)
+fng_scan:
+    LDW R1, R8
+    LEA R2, R1, 3
+    LDW R2, R2                       ; flags
+    CMPI3 R5, R2, 0
+    BRZ R5, fng_next
+    LEA R1, R1, 6                    ; &entry.name
+    const R2, FBUF
+    call str_eq                      ; R3 = 1 if equal (clobbers R1, R2, R4..R6)
+    CMPI3 R5, R3, 1
+    BRZ R5, fng_hit
+fng_next:
+    LDW R1, R8
+    ADDI R1, R1, NTE
+    STW R8, R1                       ; ptr += NTE
+    const R2, NTS
+    ADDI R2, R2, NTCNT * NTE
+    CMP3 R5, R1, R2
+    BRN R5, fng_scan
+    pop R1                           ; balanced
+    LDI R3, -1                       ; no such name
+    LDI R4, 0
+    JMP fsm_reply
+fng_hit:
+    LDW R4, R8                       ; entry ptr
+    LDW R3, R4                       ; msg1 = index
+    LEA R4, R4, 3
+    LDW R4, R4                       ; msg2 = flags
+    pop R1                           ; drop the parked ptr (R3/R4 survive)
+    JMP fsm_reply
+
+fsop_list:                           ; op 10: LIST -> FBUF lines ("name\n",
+    const R2, M8CNT                  ; dirs as "name/"), msg1 = trytes written
+    LDI R1, 0
+    STW R2, R1                       ; out pos = 0
+    const R2, NTS
+    ADD R4, R2, R0                   ; entry ptr (the fls_* helpers keep R4)
+fls_scan:
+    LEA R1, R4, 3
+    LDW R1, R1                       ; flags
+    CMPI3 R5, R1, 0
+    BRZ R5, fls_next
+    LEA R1, R4, 6
+    call fls_name                    ; append the name
+    LEA R1, R4, 3
+    LDW R1, R1                       ; flags (fls_name clobbered R1)
+    CMPI3 R5, R1, 2
+    BRNZ R5, fls_file
+    LDI R1, 47                       ; '/'
+    call fls_putc
+fls_file:
+    LDI R1, 10                       ; newline
+    call fls_putc
+fls_next:
+    ADDI R4, R4, NTE
+    const R2, NTS
+    ADDI R2, R2, NTCNT * NTE
+    CMP3 R5, R4, R2
+    BRN R5, fls_scan
+    const R3, M8CNT
+    LDW R3, R3                       ; msg1 = trytes
+    LDI R4, 0
+    JMP fsm_reply
+
+fls_putc:                            ; R1 = char -> FBUF[M8CNT++]
+    const R3, M8CNT
+    LDW R2, R3                       ; pos
+    const R5, FBUF
+    ADD R5, R5, R2
+    STT R5, R1                       ; FBUF[pos] = char
+    ADDI R2, R2, 1
+    STW R3, R2                       ; pos++
+    ret
+
+fls_name:                            ; R1 = &name -> append chars until NUL
+    push R7
+    push R1                          ; ptr (fls_putc clobbers R2/R3/R5)
+fln_loop:
+    LDW R1, R8
+    LDT R2, R1                       ; char
+    BRZ R2, fln_done
+    ADD R1, R2, R0                   ; char arg
+    call fls_putc
+    LDW R1, R8
+    ADDI R1, R1, 1
+    STW R8, R1                       ; ptr++
+    JMP fln_loop
+fln_done:
+    pop R1
+    pop R7
+    ret
+
+fsop_nameclr:                        ; op 11: NAMECLEAR(i) — remove the name
+    push R4                          ; i (no calls below, R3 survives)
+    const R2, NTS
+    ADD R3, R2, R0                   ; entry ptr
+fnc_scan:
+    LDW R5, R3                       ; entry index
+    LDW R1, R8                       ; i
+    CMP3 R5, R5, R1
+    BRNZ R5, fnc_next
+    LEA R5, R3, 3
+    LDW R1, R5                       ; flags
+    CMPI3 R6, R1, 0                  ; R6 = compare (R5 must survive: it is
+    BRZ R6, fnc_next                 ; the flags address for the STW below)
+    LDI R1, 0
+    STW R5, R1                       ; flags = 0 (freed)
+    pop R4
+    LDI R3, 0
+    LDI R4, 0
+    JMP fsm_reply
+fnc_next:
+    ADDI R3, R3, NTE
+    const R2, NTS
+    ADDI R2, R2, NTCNT * NTE
+    CMP3 R5, R3, R2
+    BRN R5, fnc_scan
+    pop R4
+    LDI R3, -1                       ; no such name
+    LDI R4, 0
+    JMP fsm_reply
+
+fsop_mkdir:                          ; op 12: MKDIR — name in FBUF; registers a
+    const R2, NTS                    ; directory entry (index = -1, D-047:
+                                     ; the namespace is server-side only, the
+                                     ; on-disk format stays flat)
+    ADD R3, R2, R0                   ; entry ptr (parked across str_eq below)
+    LDI R4, 0                        ; first free entry
+fmd_scan:
+    LEA R5, R3, 3
+    LDW R5, R5                       ; flags
+    CMPI3 R6, R5, 0
+    BRNZ R6, fmd_occ
+    CMPI3 R6, R4, 0
+    BRNZ R6, fmd_adv
+    ADD R4, R3, R0                   ; remember the first free slot
+    JMP fmd_adv
+fmd_occ:
+    push R3                          ; park the entry ptr AND the first-free
+    push R4                          ; ptr across str_eq (it returns its result
+    LEA R1, R3, 6                    ; in R3 and clobbers R1/R2/R4..R6 — D-045)
+    const R2, FBUF
+    call str_eq                      ; R3 = 1 if the name is already used
+    CMPI3 R5, R3, 1
+    pop R4                           ; restore first-free ptr (R5 survives)
+    pop R3                           ; restore entry ptr
+    BRZ R5, fmd_exists
+fmd_adv:
+    ADDI R3, R3, NTE
+    const R2, NTS
+    ADDI R2, R2, NTCNT * NTE
+    CMP3 R5, R3, R2
+    BRN R5, fmd_scan
+    CMPI3 R5, R4, 0
+    BRZ R5, fmd_full
+    LDI R1, -1
+    STW R4, R1                       ; [entry+0] = index -1 (no file slot)
+    LDI R1, 2
+    LEA R5, R4, 3
+    STW R5, R1                       ; flags = dir
+    LDI R2, 0                        ; j
+fmd_cp:
+    CMPI3 R5, R2, 23
+    BRZP R5, fmd_term
+    const R5, FBUF
+    ADD R5, R5, R2
+    LDT R1, R5                       ; name[j]
+    BRZ R1, fmd_term
+    LEA R5, R4, 6
+    ADD R5, R5, R2
+    STT R5, R1
+    ADDI R2, R2, 1
+    JMP fmd_cp
+fmd_term:
+    LEA R5, R4, 6
+    ADD R5, R5, R2
+    LDI R1, 0
+    STT R5, R1                       ; NUL-terminate
+    LDI R3, 0
+    LDI R4, 0
+    JMP fsm_reply
+fmd_exists:
+    LDI R3, -5                       ; name already in use
+    LDI R4, 0
+    JMP fsm_reply
+fmd_full:
+    LDI R3, -3                       ; name table full
+    LDI R4, 0
+    JMP fsm_reply
 
 fs_lookup:                           ; R1 = slot i -> R1 = h_ref or 0 (clobbers
     push R7                          ; R2..R5; keeps R6)
@@ -3735,6 +5357,15 @@ m5_done2:                            ; init: ready. Console input waiting ->
     const R2, UART_STAT
     LDT R3, R2                       ; nonzero = input pending
     BRZ R3, m6_off
+    ; ---- M8 phase: stage the hello program into TriFS when a shell session
+    ; starts on a usable fs. Headless boots (all regression tests) and small
+    ; disks skip it, so existing tests never see slot 1000. D-046.
+    const R2, FS_OKFLAG
+    LDW R3, R2
+    CMPI3 R5, R3, 0
+    BRNZ R5, m6_shell                ; fs unavailable: no staging
+    call m8_stage
+m6_shell:
     const R2, shell_main
     LDI R3, 0                        ; class = normal
     LDI R4, 0                        ; arg
@@ -3752,6 +5383,156 @@ m4_park:
     LDI R1, 1                        ; YIELD (only reached if power-off failed)
     TRAP 0
     JMP m4_park
+
+m8_stage:                            ; stage the hello program into TriFS
+    push R7                          ; (init thread; idempotent across reboots:
+                                     ; NAMEGET finds an existing "hello" and
+                                     ; only the content is rewritten)
+    ; FBUF = "hello"
+    LDI R2, 0                        ; j
+m8_ncp:
+    const R3, str_hello
+    ADD R3, R3, R2
+    LDT R1, R3
+    BRZ R1, m8_ncend
+    const R3, FBUF
+    ADD R3, R3, R2
+    STT R3, R1
+    ADDI R2, R2, 1
+    JMP m8_ncp
+m8_ncend:
+    const R3, FBUF
+    ADD R3, R3, R2
+    LDI R1, 0
+    STT R3, R1                       ; NUL
+    const R3, M8DIR
+    LDI R2, 0
+    STW R3, R2                       ; file flag
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10                       ; CALL
+    TRAP 0                           ; R3 = idx or -1
+    CMPI3 R5, R3, 0
+    BRP R5, m8_write                 ; already staged: rewrite the content
+    ; fresh session: create at slot 1000 (the M7 workload owns 0..999 and
+    ; runs headless only, so interactive boots never collide with it)
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 1                        ; CREATE
+    LDI R4, 1000
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R5, R3, 0
+    BRN R5, m8s2                     ; staging failed (no slot / no blocks)
+    const R3, M8DIR
+    LDI R2, 0
+    STW R3, R2
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 8                        ; NAMESET
+    LDI R4, 1000
+    LDI R1, 10
+    TRAP 0
+m8_write:
+    ; copy the embedded TXE into FBUF
+    LDI R2, 0                        ; j
+m8_tcp:
+    CMPI3 R5, R2, HELLO_TXE_LEN
+    BRZP R5, m8_twr
+    const R3, hello_txedata
+    ADD R3, R3, R2
+    LDT R1, R3
+    const R3, FBUF
+    ADD R3, R3, R2
+    STT R3, R1
+    ADDI R2, R2, 1
+    JMP m8_tcp
+m8_twr:
+    const R3, M8LEN
+    LDI R2, HELLO_TXE_LEN
+    STW R3, R2
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 7                        ; WRITE
+    LDI R4, 1000
+    LDI R1, 10
+    TRAP 0                           ; R3 = status (content committed)
+    const R1, str_m8ok
+    call puts
+    ; ---- second demo program: spin (an endless YIELD loop, the kill target)
+m8s2:
+    LDI R2, 0                        ; j
+m8s2_ncp:
+    const R3, str_spin
+    ADD R3, R3, R2
+    LDT R1, R3
+    BRZ R1, m8s2_ncend
+    const R3, FBUF
+    ADD R3, R3, R2
+    STT R3, R1
+    ADDI R2, R2, 1
+    JMP m8s2_ncp
+m8s2_ncend:
+    const R3, FBUF
+    ADD R3, R3, R2
+    LDI R1, 0
+    STT R3, R1                       ; NUL
+    const R3, M8DIR
+    LDI R2, 0
+    STW R3, R2
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 9                        ; NAMEGET
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R5, R3, 0
+    BRP R5, m8s2_write
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 1                        ; CREATE
+    LDI R4, 1001
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R5, R3, 0
+    BRN R5, m8_done
+    const R3, M8DIR
+    LDI R2, 0
+    STW R3, R2
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 8                        ; NAMESET
+    LDI R4, 1001
+    LDI R1, 10
+    TRAP 0
+m8s2_write:
+    LDI R2, 0                        ; j
+m8s2_tcp:
+    CMPI3 R5, R2, SPIN_TXE_LEN
+    BRZP R5, m8s2_twr
+    const R3, spin_txedata
+    ADD R3, R3, R2
+    LDT R1, R3
+    const R3, FBUF
+    ADD R3, R3, R2
+    STT R3, R1
+    ADDI R2, R2, 1
+    JMP m8s2_tcp
+m8s2_twr:
+    const R3, M8LEN
+    LDI R2, SPIN_TXE_LEN
+    STW R3, R2
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 7                        ; WRITE
+    LDI R4, 1001
+    LDI R1, 10
+    TRAP 0
+m8_done:
+    pop R7
+    ret
 
     ; ---- phase 6: SEND/RECV ping-pong on the master endpoint ----
     ; the cap lives in XC2 (reused: phase 5 is done) and is RE-READ every
@@ -3873,7 +5654,7 @@ str_condown:     .asciz "init: console down\n"
 str_restart:     .asciz "init: console restarted\n"
 str_shello:      .asciz "\nSetun shell (type help)\n"
 str_prompt:      .asciz "$ "
-str_help:        .asciz "builtins: help ver echo <text> crash halt\n"
+str_help:        .asciz "builtins: help ver echo <text> ls ps cat <name> ed <name> rm <name> cp <a> <b> mkdir <name> tstat <tid> kill <tid> exec <name> pipe crash halt\n"
 str_ver:         .asciz "Setun Tri OS v0.1 (ternary)\n"
 str_cmd_help:    .asciz "help"
 str_cmd_ver:     .asciz "ver"
@@ -3881,13 +5662,44 @@ str_cmd_crash:   .asciz "crash"
 str_cmd_halt:    .asciz "halt"
 str_cmd_echo:    .asciz "echo "
 str_unknown:     .asciz "unknown command\n"
+str_cmd_ls:      .asciz "ls"
+str_cmd_ps:      .asciz "ps"
+str_cmd_pipe:    .asciz "pipe"
+str_cmd_cat:     .asciz "cat"
+str_cmd_ed:      .asciz "ed"
+str_cmd_rm:      .asciz "rm"
+str_cmd_cp:      .asciz "cp"
+str_cmd_mkdir:   .asciz "mkdir"
+str_cmd_tstat:   .asciz "tstat"
+str_cmd_kill:    .asciz "kill"
+str_cmd_exec:    .asciz "exec"
+str_noent:       .asciz "no such name\n"
+str_fserr:       .asciz "fs error\n"
+str_pserr:       .asciz "ps error\n"
+str_rmok:        .asciz "rm ok\n"
+str_cpok:        .asciz "cp ok\n"
+str_mkok:        .asciz "mkdir ok\n"
+str_exists:      .asciz "mkdir: name exists\n"
+str_edok:        .asciz "ed: saved\n"
+str_exectid:     .asciz "exec: tid "
+str_execerr:     .asciz "exec error\n"
+str_nothread:    .asciz "no such thread\n"
+str_killok:      .asciz "killed\n"
+str_killbad:     .asciz "kill refused\n"
+str_pipeerr:     .asciz "pipe error\n"
+str_usage:       .asciz "usage: cp <src> <dst>\n"
+str_pipedata:    .asciz "ternary pipe ok"
+str_m8ok:        .asciz "m8: hello program staged\n"
+str_hello:       .asciz "hello"
+str_spin:        .asciz "spin"
 str_conrestart:  .asciz "console restarted\n"
 str_m7ok:        .asciz "fs: 1000 created+checked, 500 deleted, ok\n"
 str_fsck:        .asciz "fsck: "
 str_test_fail:   .asciz "self-test: FAIL\n"
 .equ FZROWS,     16
 
-FTAB:   .word 8, 999, 0, 0
+.align 3                             ; the string literals above are byte-granular;
+FTAB:   .word 8, 999, 0, 0           ; FTAB is LDW-read and must stay word-aligned
         .word 8, -1, 0, 0
         .word 9, 999, 0, 0
         .word 10, 999, 0, 0
@@ -3908,3 +5720,7 @@ FTAB:   .word 8, 999, 0, 0
 ; it is initialised before first read (buddy_init writes all states and hints;
 ; sched_init writes the TCB table, queues, CURRENT, DONE and STRESS; pnumbuf,
 ; ksave and the nodes array are written before use).
+
+; ---- M8: embedded hello TXE (generated by tools/mk.py from user/hello.asm;
+; staged into TriFS as name "hello" on interactive boots, D-046) ---------------
+    .include "hello_txedata.asm"
