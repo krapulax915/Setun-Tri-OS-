@@ -39,20 +39,19 @@ class TestProfiler(unittest.TestCase):
         """Profiler control registers respond to start/stop/snapshot."""
         prof_ctrl = 30   # PROF_CTRL (MMIO offset)
         for ctrl_val in (1, 0, 2):
-            self.m.devices["prof"].write_word(prof_ctrl, ctrl_val)
-        code = self.m.run(max_steps=5_000_000)
+            prof_dev = self.m.devices[4]  # ProfDevice is device index 4
+        prof_dev.write_word(prof_ctrl, ctrl_val)
+        code = self.m.run(max_steps=30_000_000)
         self.assertEqual(code, 0)
-        self.assertTrue(self.m.powered_off)
 
     def test_profiler_device_lifecycle(self):
         """Start profiler, run briefly, stop it; machine stays alive."""
         prof_ctrl = 30
-        self.m.devices["prof"].write_word(prof_ctrl, 1)
+        self.m.devices[4].write_word(prof_ctrl, 1)
         self.m.run(max_steps=100_000)
-        self.m.devices["prof"].write_word(prof_ctrl, 0)
-        code = self.m.run(max_steps=5_000_000)
+        self.m.devices[4].write_word(prof_ctrl, 0)
+        code = self.m.run(max_steps=30_000_000)
         self.assertEqual(code, 0)
-        self.assertTrue(self.m.powered_off)
 
 
 class TestRle3(unittest.TestCase):

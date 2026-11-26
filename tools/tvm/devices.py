@@ -104,8 +104,9 @@ class ProfDevice(Device):
         self.profiler = profiler
 
     def write_word(self, off, v):
-        if off == PROF_CTRL and self.profiler is not None:
-            self.profiler.ctrl(v)
+        if off == PROF_CTRL:
+            if self.profiler is not None:
+                self.profiler.ctrl(v)
 
 
 class Rng(Device):
