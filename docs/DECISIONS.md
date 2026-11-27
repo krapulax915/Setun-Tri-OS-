@@ -592,3 +592,20 @@ is crash-safe: the whole superblock (root+gen+sum) lands in one blk_write.
 **Found-by:** the first restore demo failed because dir_upd freed the pre-save
 chain after the save (commit message "then frees the old chain") — the free list
 head became the saved root block itself (free=1018 root=1018 in the failure dump).
+
+## D-053 — 2026-11-27 — M11 graphical UI: RAM-backed framebuffer + host-side pygame desktop
+**Choice:** the framebuffer is a reserved region of GUEST RAM (FB_RAM = frame 1420,
+320x200, 1 tryte per pixel, 0 = dark; frames 1420..1507, RES_END = 1508). The kernel
+paints with plain STT (boot pattern: border + title bars); the host UI
+(tools/tvm/ui.py, `python tools/mk.py ui`) reads the same memory and renders it in
+an SDL2/pygame window at 2x, under a live UART console pane. Keyboard input feeds
+the UART RX (feed_stdin): printable chars, Enter, Backspace, Tab; +/- tune the
+steps-per-frame budget (10k..4M); ESC quits.
+**Why pygame (host-side):** the TVM is a Python emulator; a window needs a host
+windowing library — pygame is the Python SDL. The OS itself never sees it; it only
+displays the emulated machine's framebuffer and console. The earlier passive
+viewer (display.py) was never wired to a run loop or input path — the UI replaces
+it as the interactive front end.
+**Console pane:** the decoded UART stream is split into lines; the trailing empty
+piece is the prompt line; +/- restart the stream diff so repaints only happen on
+change.

@@ -2,6 +2,21 @@
 
 All notable changes per milestone. Format: `M<n>: summary` (see GLM_MASTER_PROMPT rule 7).
 
+## M11 — 2026-11-27 — Interactive graphical UI (D-053)
+- `tools/tvm/ui.py` + `python tools/mk.py ui`: SDL2 window — framebuffer pane
+  (top) + live UART console pane (bottom, typable). Keyboard -> UART RX
+  (printable/Enter/Backspace/Tab); +/- tune steps-per-frame (10k..4M); ESC quits;
+  status bar with CURRENT tid, speed and power state. pygame is host-side only.
+- Framebuffer RAM-backed: FB_RAM = frame 1420 (320x200, 1 tryte/pixel, 0 = dark),
+  frames 1420..1507 reserved (RES_END = 1508, FREE_FRAMES = 5050). The kernel
+  paints a boot pattern (border + title bars) with plain STT after `buddy: ok`;
+  the host display and the guest see the same memory (one bus, one truth).
+- `tools/tvm/devices.py`: Framebuffer refactored to the RAM-backed model
+  (host-test mode keeps a local bytearray when no machine is attached).
+- `tests/test_m11.py`: 5 tests (kernel boot pattern visible in RAM, host/guest
+  memory sharing, console line window + repaint diff, UI boot path).
+- D-053 recorded. Tests: 143 green.
+
 ## M10 — 2026-11-27 — Tern language compiler + HW_PORT.md (optional milestone)
 - `tools/tern.py`: tiny C-like compiler targeting TriASM (TriISA v0.1).
   - Lexer: tokenizes identifiers, numbers, strings, chars, operators, keywords.

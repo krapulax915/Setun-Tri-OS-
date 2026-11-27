@@ -34,7 +34,7 @@
     .equ KSAVE,      KDATA+9842+27      ; 11 words
     .equ PNUMBUF,    KSAVE+33           ; 12 trytes
     .equ NODES,      PNUMBUF+12         ; 6132 words (self-test array)
-    .equ RES_END,    1420               ; frames [0, 1420) reserved: static data
+    .equ RES_END,    1508               ; frames [0, 1508) reserved: static data
                                         ; (TCBs, queues, idle stack, M4T, CTAB,
                                         ; EPT, fs buffers, M8 namespace area).
                                         ; frames 1415/1416 are the fs free-list
@@ -45,6 +45,10 @@
     .equ BB2,       1415 * 729          ; 729-tryte free-list IO buffer (keeps
                                         ; BBUF intact while dir_upd stages a clone)
     .equ BBUF,      1416 * 729          ; 729-tryte block buffer (TriFS)
+    .equ FB_RAM,    1420 * 729          ; framebuffer: 320x200, 1 tryte/pixel
+    .equ FB_H,      200                 ; (frames 1420..1507, 88 frames)
+    .equ FB_W,      320
+    .equ FB_ROW,    320                 ; trytes per row
     .equ FS_BASE,   28                  ; TriFS superblock block (D-042)
     .equ SB_FREE,   9                   ; superblock word offsets: free head
     .equ SB_ROOT,   12                  ; COW dir-chain root
@@ -65,7 +69,7 @@
     .equ STK_LO,     6446
     .equ STK_HI,     6448
     .equ KSTACK,     4700001
-    .equ FREE_FRAMES, 5138              ; 6561 - 1420(reserved) - 3(stack)
+    .equ FREE_FRAMES, 5050              ; 6561 - 1508(reserved) - 3(stack)
     .equ FREE_TEST,   240               ; boot self-test allocation count
 
 ; ---- scheduler constants (D-033/D-034) ---------------------------------------
@@ -252,6 +256,55 @@ st_alloc2_done:
     BRNZ R5, st_fail
     const R1, str_buddy_ok
     call puts
+
+    ; ---- framebuffer boot pattern (M11): RAM-backed FB at FB_RAM, 1 tryte
+    ; per pixel; the host UI renders it live. Border + title bars.
+    LDI R3, 0                         ; y
+fbp_row:
+    MULI R4, R3, FB_ROW               ; row base offset
+    const R1, FB_RAM
+    ADD R4, R1, R4                    ; R4 = &FB_RAM[y][0]
+    LDI R5, 0                         ; color: 0 = dark
+    CMPI3 R1, R3, 2
+    BRN R1, fbp_lit
+    CMPI3 R1, R3, 198
+    BRZP R1, fbp_lit
+    CMPI3 R1, R3, 10
+    BRN R1, fbp_dark
+    CMPI3 R1, R3, 14
+    BRN R1, fbp_lit
+    JMP fbp_dark
+fbp_lit:
+    LDI R5, 1
+fbp_dark:
+    ADD R1, R5, R0
+    LDI R2, 0                         ; x
+fbp_x:
+    STT R4, R1                        ; FB_RAM[y][x] = color
+    ADDI R4, R4, 1
+    ADDI R2, R2, 1
+    CMPI3 R6, R2, FB_W
+    BRN R6, fbp_x
+    ADDI R3, R3, 1
+    CMPI3 R6, R3, FB_H
+    BRN R6, fbp_row
+    ; side columns: x = 0..1 and 318..319 lit on every row
+    LDI R3, 0
+fbp_side:
+    MULI R4, R3, FB_ROW
+    const R1, FB_RAM
+    ADD R4, R1, R4
+    LDI R1, 1
+    STT R4, R1
+    ADDI R4, R4, 1
+    STT R4, R1
+    ADDI R4, R4, 316
+    STT R4, R1
+    ADDI R4, R4, 1
+    STT R4, R1
+    ADDI R3, R3, 1
+    CMPI3 R6, R3, FB_H
+    BRN R6, fbp_side
     JMP bt_trap_demo
 st_fail:
     const R1, str_buddy_fail

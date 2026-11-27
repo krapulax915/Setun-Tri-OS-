@@ -35,7 +35,7 @@ Core numbers / Alapadatok:
 | Page / oldal | 729 trytes / tryte |
 | ISA | 49 opcodes, 4-trit op field, `[op:4\|rd:2\|rs:2\|imm:10]` |
 | Compare / összehasonlítás | three-way, no flags / háromutas, nincs flag-regiszter |
-| Tests / tesztek | 134 green / zöld |
+| Tests / tesztek | 143 green / zöld |
 
 ## Status / Állapot
 
@@ -60,6 +60,7 @@ tesztkészlettel. A jelenlegi állapot:
 | M8 | TXE loader + coreutils + pipes | ✅ |
 | M9 | Profiler + `rle3`/`huff3` compression | ✅ |
 | M10 | Tern language compiler + `HW_PORT.md` | ✅ |
+| M11 | Interactive graphical UI (framebuffer + typable console, `mk.py ui`) | ✅ |
 
 ## Highlights so far / Eddigi eredmények
 
@@ -123,6 +124,11 @@ python tools/mk.py test
 # trap demo, clean power-off / lemezkép készítés és boot:
 # banner, buddy önteszt, trap demó, tisztán leállás
 python tools/mk.py run
+
+# interactive graphical UI / interaktív grafikus UI (M11):
+# framebuffer pane + typable console / framebuffer panel + gépelhető konzol
+pip install pygame
+python tools/mk.py ui
 ```
 
 ## Repository layout / A repó felépítése

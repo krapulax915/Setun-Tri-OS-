@@ -119,7 +119,8 @@ class Machine:
         self._dev_rng = Rng(self, seed)
         self._dev_power = PowerDevice(self)
         self._dev_prof = ProfDevice(self)
-        self._dev_fb = Framebuffer(self, width=320, height=200, bpp=1)
+        self._dev_fb = Framebuffer(self, width=320, height=200, bpp=1,
+                                   ram_base=1420 * 729)
         self.devices = [self._dev_uart, self._dev_blk, self._dev_rng,
                         self._dev_power, self._dev_prof, self._dev_fb]
         self.bus = MmioBus(self.ram, self.devices)

@@ -281,11 +281,12 @@ class TestBuddy(unittest.TestCase):
         self.assertEqual(count, self.sym["FREE_FRAMES"])
 
     def test_split_and_merge_states(self):
-        # Fill the depth-5 blocks of node 2's subtree (j 53..80, nodes 175..202,
-        # the first-fit region after the reserved frames) so the next order-3
-        # allocation lands in node 3's fully free region (j 81..161) — only
-        # there can a free merge back through the whole ancestry.
-        for _ in range(28):
+        # Fill the depth-5 blocks of node 2's subtree (j 56..80, nodes 178..202,
+        # the first-fit region after the reserved frames — RES_END = 1508; 25
+        # blocks, exactly node 2's remainder) so the next order-3 allocation
+        # lands at node 3's first block (j 81) — only there can a free merge
+        # back through the whole ancestry (node 3's other blocks are all free).
+        for _ in range(25):
             self.assertGreater(self.call("buddy_alloc", 3), 0)
         n = self.call("buddy_alloc", 3)                 # j=81 -> node 203
         self.assertEqual(n, 203)

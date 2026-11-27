@@ -202,24 +202,46 @@ class BlockDevice(Device):
 
 
 class Framebuffer(Device):
-    """Framebuffer graphics device with MMIO interface."""
+    """Framebuffer graphics device (M11): RAM-backed — the frame lives in a
+    reserved region of guest RAM (FB_RAM, 1 tryte per pixel, 0 = dark), so the
+    kernel paints with plain STT and the host UI reads the same memory.
+    Host-test mode (no machine): a local bytearray backs the pixels."""
     name = "fb"
-    
-    def __init__(self, machine=None, width=320, height=200, bpp=1):
+
+    def __init__(self, machine=None, width=320, height=200, bpp=1, ram_base=0):
         # Support both Framebuffer(width, height, bpp) and Framebuffer(machine, width, height, bpp)
         if machine is not None and not isinstance(machine, (int, type(None))):
-            # Called as Framebuffer(machine, width, height, bpp)
             super().__init__(machine)
         else:
-            # Called as Framebuffer(width, height, bpp) - machine is actually width
             super().__init__(None)
             width, height, bpp = machine, width, height
         self.width = width
         self.height = height
         self.bpp = bpp
-        self.frame = bytearray(width * height * max(1, bpp // 8))
+        self.ram_base = ram_base        # 0 = host-test mode (local bytearray)
+        self.frame = bytearray(width * height)
         self.dirty = True
         self.palette = self._default_palette()
+
+    def _pix_addr(self, x, y):
+        return self.ram_base + y * self.width + x
+
+    def set_pixel(self, x, y, color):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            if self.machine is not None and self.ram_base:
+                self.machine.bus.write_tryte(self._pix_addr(x, y),
+                                             T.wrap(color, T.TRYTE_TRITS))
+            else:
+                self.frame[y * self.width + x] = color
+            self.dirty = True
+
+    def get_pixel(self, x, y):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            if self.machine is not None and self.ram_base:
+                v = self.machine.bus.read_tryte(self._pix_addr(x, y))
+                return 1 if v != 0 else 0
+            return self.frame[y * self.width + x]
+        return 0
     
     def _default_palette(self):
         pal = []
@@ -230,35 +252,15 @@ class Framebuffer(Device):
             pal.append((r >> 16, g >> 19, b >> 22))
         return pal
     
-    def set_pixel(self, x, y, color):
-        if 0 <= x < self.width and 0 <= y < self.height:
-            idx = y * self.width + x
-            if self.bpp == 1:
-                byte_idx = idx // 8
-                bit = idx % 8
-                if color:
-                    self.frame[byte_idx] |= (1 << (7 - bit))
-                else:
-                    self.frame[byte_idx] &= ~(1 << (7 - bit))
-            else:
-                self.frame[idx] = color
-            self.dirty = True
-    
-    def get_pixel(self, x, y):
-        if 0 <= x < self.width and 0 <= y < self.height:
-            idx = y * self.width + x
-            if self.bpp == 1:
-                byte_idx = idx // 8
-                bit = idx % 8
-                return (self.frame[byte_idx] >> (7 - bit)) & 1
-            return self.frame[idx]
-        return 0
     
     def fill(self, color):
-        if self.bpp == 1:
-            self.frame = bytearray([0xFF if color else 0x00] * len(self.frame))
+        if self.machine is not None and self.ram_base:
+            for y in range(self.height):
+                for x in range(self.width):
+                    self.machine.bus.write_tryte(self._pix_addr(x, y),
+                                                 T.wrap(color, T.TRYTE_TRITS))
         else:
-            self.frame = bytearray([color] * len(self.frame))
+            self.frame = bytearray([1 if color else 0] * len(self.frame))
         self.dirty = True
     
     def read_word(self, off):

@@ -254,6 +254,15 @@ def profile(args):
 
 
 @target
+def ui(args):
+    """M11: interactive graphical UI — boots the OS and opens an SDL2 window
+    (framebuffer pane + typable console). Host-side pygame only."""
+    ensure_build_dir()
+    from tvm.ui import main as ui_main
+    return ui_main()
+
+
+@target
 def clean(args):
     import shutil
     if os.path.isdir(BUILD):
