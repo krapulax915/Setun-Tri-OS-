@@ -93,9 +93,13 @@ def read_super(blocks):
     return w
 
 
-def read_dir_chain(blocks, root, expected_count):
-    """Walk the COW dir chain; returns the ref vector (len = expected_count),
-    checking every block's count/next linkage."""
+def read_dir_chain(blocks, root, expected_count=None):
+    """Walk the COW dir chain; returns the ref vector.
+
+    expected_count=None: walk until next == 0, collecting DIR_REFS refs per
+    block (robust for power-cut images where a freed dir clone's count field
+    may hold a free-list pointer — only the LIVE chain's link structure is
+    trusted). With a count: verifies the collected length matches."""
     refs = []
     lba = root
     while lba:
@@ -104,16 +108,20 @@ def read_dir_chain(blocks, root, expected_count):
             raise ValueError("missing dir block %d" % lba)
         count = T.trytes_to_word(blk[0:WORD])
         nxt = T.trytes_to_word(blk[WORD:WORD * 2])
-        take = min(count, DIR_REFS)
+        # fixed 5-level chain (D-043): every level holds DIR_REFS slots;
+        # trailing zero refs = unassigned slots. None-mode trusts only the
+        # link structure (freed clones' count fields are free-list pointers).
+        take = DIR_REFS if expected_count is None else min(count, DIR_REFS)
         for i in range(take):
             off = WORD * 2 + i * WORD
             refs.append(T.trytes_to_word(blk[off:off + WORD]))
-        if take < count:
-            raise ValueError("dir block split entry")
-        if count > DIR_REFS and not nxt:
-            raise ValueError("dir chain broken after block %d" % lba)
+        if expected_count is not None:
+            if take < count:
+                raise ValueError("dir block split entry")
+            if count > DIR_REFS and not nxt:
+                raise ValueError("dir chain broken after block %d" % lba)
         lba = nxt
-    if len(refs) != expected_count:
+    if expected_count is not None and len(refs) != expected_count:
         raise ValueError("dir chain has %d refs, expected %d" %
                          (len(refs), expected_count))
     return refs

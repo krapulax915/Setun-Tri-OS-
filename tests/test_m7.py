@@ -52,16 +52,26 @@ class TestTriFS(unittest.TestCase):
         rom, disk = build_disk()
         m, code, text = boot_with(rom, disk)
         self.assertIn("fs: 1000 created+checked, 500 deleted, ok", text)
+        self.assertIn("fs: snapshot save/restore ok", text)
         self.assertIn("Setun Tri OS v0.1 ready", text)
         self.assertEqual(code, 0)
         self.assertTrue(m.powered_off)
-        # host-side verification of the surviving tree (500 files)
+        # host-side verification of the surviving tree (500 files; the 5
+        # post-snapshot extras were removed by the restore)
         blocks = disk_to_blocks(m)
         sb = trifs.read_super(blocks)
-        self.assertEqual(sb[trifs.SB_GEN], 1500)     # 1000 create + 500 delete
+        # 1000 create + 500 delete + 5 snapshot-demo create + 1 restore bump
+        self.assertEqual(sb[trifs.SB_GEN], 1506)
         refs = trifs.read_dir_chain(blocks, sb[trifs.SB_ROOT], 1000)
         alive = sum(1 for r in refs if r != 0)
         self.assertEqual(alive, 500)
+        for i, r in enumerate(refs):
+            if i >= 1000:
+                self.assertEqual(r, 0)               # extras rolled back
+            if r:
+                n, s = trifs.read_file(blocks, r)
+                self.assertEqual(n, 729)
+                self.assertIsNotNone(s)              # sum matched
         for i, r in enumerate(refs):
             if r:
                 n, s = trifs.read_file(blocks, r)
@@ -71,15 +81,18 @@ class TestTriFS(unittest.TestCase):
     def test_power_cut_leaves_consistent_image(self):
         rom, disk = build_disk()
         rng = random.Random(42)
-        killed_at = rng.randint(2_000_000, 30_000_000)
+        killed_at = rng.randint(2_000_000, 40_000_000)
         m, _, _ = boot_with(rom, disk, max_steps=killed_at)
         self.assertFalse(m.powered_off)              # killed mid-workload
         blocks = disk_to_blocks(m)
         sb = trifs.read_super(blocks)                # superblock readable
         if sb[trifs.SB_ROOT] == 0:
             return                                   # killed before first commit
-        refs = trifs.read_dir_chain(blocks, sb[trifs.SB_ROOT],
-                                    sb[trifs.SB_ROOT] and 1000)
+        # the dir count varies with the kill point (1000 workload refs, or
+        # 1000..1005 if killed inside the snapshot demo) — walk the chain
+        # without a hardcoded count (freed dir clones' count fields may hold
+        # free-list pointers, so only the link structure is trusted)
+        refs = trifs.read_dir_chain(blocks, sb[trifs.SB_ROOT])
         for r in refs:
             if r:
                 n, s = trifs.read_file(blocks, r)

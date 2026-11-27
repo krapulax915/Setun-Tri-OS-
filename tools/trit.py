@@ -363,11 +363,65 @@ def _huff3_codebook(symbols):
     return {s[0]: [-1, -1], s[1]: [-1, 1], s[2]: [1, -1]}
 
 
+def _huff3_codebook_n(freq):
+    """3-ary Huffman codebook from {symbol: weight} — supports N symbols.
+
+    Dummy zero-weight leaves pad the leaf count to odd so the ternary tree is
+    full ((L-1)/2 internal nodes); codes are trit paths {-1, 0, +1} from root.
+    """
+    import heapq
+    syms = list(freq.keys())
+    if len(syms) <= 3:
+        return _huff3_codebook(syms)
+    leaves = []
+    for i, (sym, w) in enumerate(sorted(freq.items(), key=lambda kv: -kv[1])):
+        leaves.append((w, i, ('leaf', sym)))
+    nid = len(syms)
+    while len(leaves) % 2 == 0:
+        leaves.append((0, nid, ('leaf', None)))
+        nid += 1
+    heap = [(w, i, node) for w, i, node in leaves]
+    heapq.heapify(heap)
+    while len(heap) > 1:
+        kids = []
+        wsum = 0
+        for _ in range(3):
+            if heap:
+                w, _, node = heapq.heappop(heap)
+                kids.append(node)
+                wsum += w
+            else:
+                kids.append(('leaf', None))
+        heapq.heappush(heap, (wsum, nid, ('node', kids)))
+        nid += 1
+    root = heap[0][2]
+    codebook = {}
+
+    def walk(node, prefix):
+        kind, payload = node
+        if kind == 'leaf':
+            if payload is not None:
+                codebook[payload] = prefix if prefix else [0]
+            return
+        for trit, child in zip((-1, 0, 1), payload):
+            walk(child, prefix + [trit])
+
+    walk(root, [])
+    return codebook
+
+
 def huff3(data):
-    """Ternary Huffman encode (canonical fixed codebook per distinct symbol set)."""
+    """Ternary Huffman encode — real 3-ary Huffman for arbitrary symbol sets.
+
+    Frequency-based 3-ary Huffman tree; codes are trit paths {-1, 0, +1} from
+    the root. Falls back to the canonical fixed codebook for <=3 symbols.
+    """
     if not data:
         return []
-    code = _huff3_codebook(set(data))
+    freq = {}
+    for sym in data:
+        freq[sym] = freq.get(sym, 0) + 1
+    code = _huff3_codebook_n(freq)
     out = []
     for sym in data:
         out.extend(code[sym])

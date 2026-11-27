@@ -40,9 +40,18 @@ intended for hardware engineers porting the OS off the TVM emulator.
 | Power  | 27     | POWER (27) — write 1 = power off, -1 = reset |
 | RNG    | 24     | VAL (24) |
 | Profiler | 30   | CTRL (30), ACK (33) |
+| Framebuffer | 36 | WIDTH (36), HEIGHT (39), STRIDE (42), FORMAT (45), PALETTE (48), CTRL (144), FRAME (147) |
 
-- **IRQ lines**: `IRQ_BASE + device_id` (UART=10, block=12, RNG=13, profiler=14).
+- **IRQ lines**: `IRQ_BASE + device_id` (UART=11, block=12, RNG=13, profiler=14, framebuffer=15).
 - **Timer**: separate CSR (TIMER_CMP, TIME, CYCLE) — level-triggered at TIME >= CMP.
+
+## 3b. Framebuffer
+
+- Monochrome (1 bpp) default; FORMAT selects 1/8/24 bits per pixel.
+- The frame buffer lives in dedicated device memory; CTRL bit 0 (DIRTY) flags
+  changes for the host display; writes to any register mark the frame dirty.
+- Host side: `tools/tvm/display.py` renders the frame in an SDL2/pygame window
+  (3x scaling) with a terminal fallback (ANSI full-block rendering).
 
 ## 4. Trap vector
 

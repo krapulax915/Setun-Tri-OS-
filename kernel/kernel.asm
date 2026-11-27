@@ -132,6 +132,11 @@
     .equ XFS,       EPT + 261           ; fs endpoint cap (word-aligned!)
     .equ FS_CAP,    EPT + 264           ; fs server's own cap, parked in MEMORY
                                         ; (D-041): R6 is scratch for the format
+    .equ SNAP_ROOT, EPT + 267           ; parked (root, gen) pair for the M7
+    .equ SNAP_GEN,  EPT + 270           ; SNAPSHOT ops 13/14 (save/restore)
+    .equ SNAP_TEST, EPT + 273           ; init snapshot-demo parking slot
+    .equ SNAP_ARMED, EPT + 276          ; != 0: dir_upd leaks the old chain
+                                        ; (the saved tree shares its blocks)
                                         ; loop and every op handler, so the cap
                                         ; is re-read from here before each IPC
 
@@ -4020,6 +4025,13 @@ du_done:
     LDW R3, R1                       ; cur = old root (0: first commit)
     CMPI3 R1, R3, 0
     BRZ R1, du_frdone
+    ; snapshot armed (SNAP_ARMED != 0): LEAK the old chain — the saved tree
+    ; shares these blocks, so they must stay off the free list until the
+    ; snapshot is discarded (restore or overwrite). v0.1 trade-off (D-052).
+    const R2, SNAP_ARMED
+    LDW R2, R2
+    CMPI3 R1, R2, 0
+    BRNZ R1, du_frdone
 du_freep:
     push R3                          ; cur across the read
     ADD R1, R3, R0
@@ -4177,6 +4189,10 @@ fsm_loop:
     BRZ R1, fsop_nameclr
     CMPI3 R1, R3, 12
     BRZ R1, fsop_mkdir
+    CMPI3 R1, R3, 13
+    BRZ R1, fsop_snap_save
+    CMPI3 R1, R3, 14
+    BRZ R1, fsop_snap_restore
     LDI R3, -4                       ; unknown op
     LDI R4, 0
     JMP fsm_reply
@@ -4370,6 +4386,62 @@ fk_done:
     pop R4                           ; total (msg2)
     pop R3                           ; ok (msg1)
     JMP fsm_reply
+
+; ---- M7 snapshot API (ops 13/14): park/restore the COW (root, gen) pair.
+; Every prior root's blocks stay readable (COW never recycles pre-delete
+; blocks), so restoring an old root yields a consistent tree; blocks allocated
+; after the save are leaked, not corrupted (v0.1 trade-off, documented).
+
+fsop_snap_save:                      ; op 13: SNAP_ROOT/SNAP_GEN <- super,
+                                     ; arm dir_upd's old-chain leak
+    LDI R1, FS_BASE
+    call blk_read                    ; superblock -> BBUF
+    const R2, BBUF + SB_ROOT
+    LDW R3, R2                       ; root
+    const R2, SNAP_ROOT
+    STW R2, R3
+    const R2, BBUF + SB_GEN
+    LDW R3, R2                       ; gen
+    const R2, SNAP_GEN
+    STW R2, R3
+    const R2, SNAP_ARMED
+    LDI R1, 1
+    STW R2, R1                       ; arm: leak old chains while armed
+    ADD R3, R3, R0                   ; reply1 = saved gen
+    LDI R4, 0
+    JMP fsm_reply
+
+fsop_snap_restore:                   ; op 14: super <- parked pair, gen += 1,
+                                     ; disarm the old-chain leak
+    const R2, SNAP_ROOT
+    LDW R4, R2                       ; saved root (R4 survives blk_read/write)
+    CMPI3 R5, R4, 0
+    BRN R5, fsr_none
+    const R2, SNAP_GEN
+    LDW R5, R2                       ; saved gen (R5 survives blk_* too)
+    LDI R1, FS_BASE
+    call blk_read                    ; superblock -> BBUF (clobbers R2, R3)
+    const R2, BBUF + SB_ROOT
+    STW R2, R4                       ; ROOT = saved root
+    const R2, BBUF + SB_GEN
+    LDW R3, R2                       ; CURRENT gen (monotonic: never goes back)
+    ADDI R3, R3, 1                   ; gen = current + 1
+    STW R2, R3
+    const R1, BBUF
+    call super_sum                   ; refresh the superblock checksum
+    LDI R1, FS_BASE
+    call blk_write
+    const R2, SNAP_ARMED
+    LDI R1, 0
+    STW R2, R1                       ; disarm: normal reclaim resumes
+    ADD R3, R5, R0                   ; reply1 = saved gen
+    LDI R4, 0
+    JMP fsm_reply
+fsr_none:
+    LDI R3, -5                       ; no snapshot saved
+    LDI R4, 0
+    JMP fsm_reply
+
 fsm_reply:
     LDI R1, 11                       ; REPLY
     const R2, FS_CAP
@@ -5227,6 +5299,9 @@ m5_done:
     call puts
 
     ; ---- M7 phase: TriFS (D-042) ----
+    const R2, SNAP_ARMED
+    LDI R1, 0
+    STW R2, R1                       ; BSS init (D-032): snapshot disarmed
     LDI R1, 17                       ; EP_CREATE the fs endpoint
     LDI R2, 4                        ; badge
     TRAP 0
@@ -5326,6 +5401,85 @@ m7_kee:
     CMPI3 R2, R5, 1000
     BRN R2, m7_kee
     const R1, str_m7ok
+    call puts
+
+    ; ---- M7 snapshot round-trip (ops 13/14): SAVE -> 5 post-snapshot files
+    ; -> RESTORE -> the extras must be gone, the pre-snapshot tree intact.
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 13                        ; SNAPSHOT_SAVE
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0
+    const R2, SNAP_TEST
+    STW R2, R3                        ; park saved gen (calls clobber regs)
+    ; create files 1000..1004 (post-snapshot)
+    LDI R5, 1000
+m7_snap_create:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 1                         ; CREATE
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, 0
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 1005
+    BRN R2, m7_snap_create
+    ; extras must check ok BEFORE the restore
+    LDI R5, 1000
+m7_snap_chk1:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 2
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, 0
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 1005
+    BRN R2, m7_snap_chk1
+    ; RESTORE
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 14                        ; SNAPSHOT_RESTORE
+    LDI R4, 0
+    LDI R1, 10
+    TRAP 0
+    ; R3 = saved gen (monotonic gen kept: current+1 written on-disk)
+    CMPI3 R2, R3, 0
+    BRN R2, st_fail2                  ; restore must succeed (gen >= 0)
+    ; extras must be missing AFTER the restore
+    LDI R5, 1000
+m7_snap_chk2:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 2
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, -2
+    BRNZ R2, st_fail2                 ; must be missing
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 1005
+    BRN R2, m7_snap_chk2
+    ; 500..999 survivors must still check ok
+    LDI R5, 500
+m7_snap_keep:
+    const R3, XFS
+    LDW R2, R3
+    LDI R3, 2
+    ADD R4, R5, R0
+    LDI R1, 10
+    TRAP 0
+    CMPI3 R2, R3, 0
+    BRNZ R2, st_fail2
+    ADDI R5, R5, 1
+    CMPI3 R2, R5, 1000
+    BRN R2, m7_snap_keep
+    const R1, str_snapok
     call puts
     JMP m5_done2
 m7_fsck:
@@ -5694,6 +5848,7 @@ str_hello:       .asciz "hello"
 str_spin:        .asciz "spin"
 str_conrestart:  .asciz "console restarted\n"
 str_m7ok:        .asciz "fs: 1000 created+checked, 500 deleted, ok\n"
+str_snapok:      .asciz "fs: snapshot save/restore ok\n"
 str_fsck:        .asciz "fsck: "
 str_test_fail:   .asciz "self-test: FAIL\n"
 .equ FZROWS,     16

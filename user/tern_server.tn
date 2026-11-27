@@ -1,0 +1,14 @@
+// tern_server.tn — the wr_server echo protocol rewritten in Tern (M10).
+// Protocol (kernel wr_server, kernel.asm): RECV on the parked endpoint cap,
+// reply = request + 1, SEND the reply, loop forever. The thread's create
+// argument (the endpoint cap) is parked by the generated prologue into
+// TERN_CAP_SLOT; recv/send/reply are compiler-emitted syscall wrappers
+// (num 9/8/11, cap in R2, msg in R3 — D-041 ABI).
+int main() {
+    int msg = 0;
+    while (1) {
+        msg = recv();
+        reply(msg + 1);
+    }
+    exit(0);
+}

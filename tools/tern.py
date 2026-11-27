@@ -29,6 +29,11 @@ TOKENS = [
     # I/O builtins
     ("PUTCHAR", r"\bputchar\b"),
     ("PUTS", r"\bputs\b"),
+    # IPC builtins (server target, M10): map to kernel syscalls 9/8/11/2
+    ("RECV", r"\brecv\b"),
+    ("SEND", r"\bsend\b"),
+    ("REPLY", r"\breply\b"),
+    ("EXIT", r"\bexit\b"),
     # literals
     ("NUMBER", r"-?\d+"),
     ("STRING", r'"(?:\\.|[^"\\])*"'),
@@ -247,7 +252,14 @@ class Parser:
         return self.parse_expr()
 
     def parse_expr(self):
-        return self.parse_logical_or()
+        left = self.parse_logical_or()
+        # assignment (lowest precedence, right-assoc; target must be a VarRef)
+        if self.peek("ASSIGN", "PLUSEQ", "MINUSEQ", "MULEQ", "DIVEQ", "MODEQ"):
+            if isinstance(left, VarRef):
+                op = self.eat(self.current.type)
+                value = self.parse_expr()
+                return Assign(left, op, value)
+        return left
 
     def parse_logical_or(self):
         left = self.parse_logical_and()
@@ -327,7 +339,7 @@ class Parser:
         if self.peek("CHARLIT"):
             v = self.eat("CHARLIT")[1:-1]
             return CharLit(v)
-        if self.peek("IDENT", "PUTS", "PUTCHAR"):
+        if self.peek("IDENT", "PUTS", "PUTCHAR", "RECV", "SEND", "REPLY", "EXIT"):
             name = self.eat(self.current.type)
             # function call
             if self.peek("LPAREN"):
@@ -366,7 +378,7 @@ class CodeGen:
         for lbl, val in self.strings.items():
             if val == s: return lbl
         self.string_id += 1
-        lbl = f".Lstr{self.string_id}"
+        lbl = f"Lstr{self.string_id}"
         self.strings[lbl] = s
         return lbl
 
@@ -377,6 +389,17 @@ class CodeGen:
             self.next_local_off -= 3
             self.var_offsets[name] = self.next_local_off
         return self.var_offsets[name]
+
+    def _call_target(self, name):
+        """Map builtin names to the compiler-emitted wrapper labels."""
+        return {
+            "putchar": "tern_putchar",
+            "puts": "tern_puts",
+            "recv": "tern_recv",
+            "send": "tern_send",
+            "reply": "tern_reply",
+            "exit": "tern_exit",
+        }.get(name, name)
 
     def gen_expr(self, node):
         if isinstance(node, Number):
@@ -416,7 +439,7 @@ class CodeGen:
             for arg in reversed(node.args):
                 self.gen_expr(arg)
                 self.emit("    push R1")
-            self.emit(f"    call {node.name}")
+            self.emit("    call %s" % self._call_target(node.name))
             for _ in node.args: self.emit("    pop R1")
         elif isinstance(node, Number):
             self.emit(f"    const R1, {node.value}")
@@ -432,11 +455,6 @@ class CodeGen:
             self.emit(f"    LEA R2, R8, {off}")
             self.emit("    pop R1")
             self.emit("    STW R2, R1")
-        elif isinstance(node, StringLit):
-            lbl = self.string_label(node.value)
-            self.emit(f"    const R1, {lbl}")
-        elif isinstance(node, CharLit):
-            self.emit(f"    const R1, {ord(node.value)}")
         elif isinstance(node, VarRef):
             off = self.get_var_offset(node.name)
             if off > 0:
@@ -503,7 +521,7 @@ class CodeGen:
             for arg in reversed(node.args):
                 self.gen_expr(arg)
                 self.emit("    push R1")
-            self.emit(f"    call {node.name}")
+            self.emit("    call %s" % self._call_target(node.name))
             for _ in node.args: self.emit("    pop R1")
 
     def generate(self, program):
@@ -527,20 +545,123 @@ class CodeGen:
         self.emit("")
         return "\n".join(self.lines)
 
-def compile_tern(source, output_file):
+    def generate_txe(self, program, org=4707002):
+        """M8 user-program format (D-046/D-048): standalone TXE loaded via exec.
+
+        The thread starts with R1 = create-argument (the endpoint cap); the
+        prologue parks it in TERN_CAP_SLOT. IPC builtins (recv/send/reply)
+        are compiler-emitted wrappers over the kernel syscalls
+        (num: 9=RECV, 8=SEND, 11=REPLY; cap in R2, msg in R3).
+        """
+        # strings first (labels needed by the body)
+        self.lines = []
+        self.emit("; ==== Tern-generated TXE (user program, D-046/D-048) ====")
+        self.emit('    .include "lib/trilib.asm"')
+        self.emit("    .org %d" % org)          # must be == 0 mod 3 (D-048)
+        self.emit("    .entry tern_main")
+        self.emit("TERN_CAP_SLOT: .word 0       ; parked create-arg (cap ref)")
+        self.emit("")
+        # builtin wrappers (emit before the body so calls resolve)
+        self.emit("tern_recv:                    ; -> R1 = msg (0 = no sender)")
+        self.emit("    push R7")
+        self.emit("    LDI R1, 9                  ; RECV")
+        self.emit("    const R2, TERN_CAP_SLOT")
+        self.emit("    LDW R2, R2")
+        self.emit("    TRAP 0")
+        self.emit("    ADD R1, R3, R0             ; msg1 -> result")
+        self.emit("    pop R7")
+        self.emit("    ret")
+        self.emit("")
+        self.emit("tern_send:                    ; R1 = msg -> SEND")
+        self.emit("    push R7")
+        self.emit("    push R1")
+        self.emit("    LDI R1, 8                  ; SEND")
+        self.emit("    const R2, TERN_CAP_SLOT")
+        self.emit("    LDW R2, R2")
+        self.emit("    pop R3                     ; msg1")
+        self.emit("    TRAP 0")
+        self.emit("    pop R7")
+        self.emit("    ret")
+        self.emit("")
+        self.emit("tern_reply:                   ; R1 = msg -> REPLY")
+        self.emit("    push R7")
+        self.emit("    push R1")
+        self.emit("    LDI R1, 11                 ; REPLY")
+        self.emit("    const R2, TERN_CAP_SLOT")
+        self.emit("    LDW R2, R2")
+        self.emit("    pop R3                     ; reply msg1")
+        self.emit("    TRAP 0")
+        self.emit("    pop R7")
+        self.emit("    ret")
+        self.emit("")
+        self.emit("tern_putchar:                 ; R1 = char -> DEBUG_PUTC (6)")
+        self.emit("    push R7")
+        self.emit("    push R1")
+        self.emit("    LDI R1, 6")
+        self.emit("    pop R2                     ; char into arg slot")
+        self.emit("    TRAP 0")
+        self.emit("    pop R7")
+        self.emit("    ret")
+        self.emit("")
+        self.emit("tern_puts:                    ; R1 = &msg (NUL-terminated)")
+        self.emit("    push R7")
+        self.emit("    ADD R3, R1, R0")
+        self.emit("Ltp_loop:")
+        self.emit("    LDT R2, R3")
+        self.emit("    BRZ R2, Ltp_done")
+        self.emit("    push R3")
+        self.emit("    ADD R1, R2, R0")
+        self.emit("    call tern_putchar")
+        self.emit("    pop R3")
+        self.emit("    ADDI R3, R3, 1")
+        self.emit("    JMP Ltp_loop")
+        self.emit("Ltp_done:")
+        self.emit("    pop R7")
+        self.emit("    ret")
+        self.emit("")
+        self.emit("tern_exit:                    ; EXIT (2): thread reaped")
+        self.emit("    LDI R1, 2")
+        self.emit("    TRAP 0")
+        self.emit("    ret")
+        self.emit("")
+        # entry: park the cap, run the body
+        self.emit("tern_main:")
+        self.emit("    push R7")
+        self.emit("    const R2, TERN_CAP_SLOT")
+        self.emit("    STW R2, R1                 ; park create-arg (cap)")
+        self.gen_stmt(program.funcs[0].body)
+        self.emit("    call tern_exit")
+        self.emit("")
+        # string data at the end of the image
+        self.emit("; ==== STRING DATA ====")
+        for lbl, s in self.strings.items():
+            esc = s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\"", "\\\"")
+            self.emit(f'{lbl}: .asciz "{esc}"')
+        return "\n".join(self.lines)
+
+def compile_tern(source, output_file, target="kernel", org=4707002):
+    """target: 'kernel' (kernel-integrated, .include kernel) or
+    'txe' (M8 user-program format, exec-loadable, IPC builtins)."""
     tokens = tokenize(source)
     parser = Parser(tokens)
     program = parser.parse()
     cg = CodeGen()
-    asm = cg.generate(program)
+    if target == "txe":
+        asm = cg.generate_txe(program, org=org)
+    else:
+        asm = cg.generate(program)
     from pathlib import Path
     Path(output_file).write_text(asm, encoding="utf-8")
-    print(f"Generated {output_file}")
+    print(f"Generated {output_file} (target={target})")
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python tern.py <input.tn> <output.asm>")
-        sys.exit(1)
-    with open(sys.argv[1]) as f:
+    import argparse
+    ap = argparse.ArgumentParser(description="Tern -> TriASM compiler")
+    ap.add_argument("input")
+    ap.add_argument("output")
+    ap.add_argument("--target", choices=("kernel", "txe"), default="kernel")
+    ap.add_argument("--org", type=int, default=4707002)
+    a = ap.parse_args()
+    with open(a.input) as f:
         src = f.read()
-    compile_tern(src, sys.argv[2])
+    compile_tern(src, a.output, target=a.target, org=a.org)

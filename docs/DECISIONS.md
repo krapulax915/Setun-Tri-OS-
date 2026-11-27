@@ -576,3 +576,19 @@ SOURCE name — cp reported ok while corrupting the namespace. The bug only
 showed with two full-length arguments, and the echo hid it (the swallowed char
 was never echoed either). Any shell line above 24 chars was truncated, so the
 fix is generic, not cp-specific.
+
+## D-052 — 2026-11-27 — TriFS snapshot: armed-leak instead of free-list rollback
+**Choice:** SNAPSHOT_SAVE (op 13) parks (root, gen) in memory slots and ARMS a flag;
+while armed, dir_upd leaks the old COW chain instead of freeing it (the saved tree
+shares those blocks); SNAPSHOT_RESTORE (op 14) swaps the superblock back to the
+saved root, bumps the CURRENT gen monotonically, refreshes the super checksum and
+disarms. Blocks allocated while armed are leaked on restore (v0.1 trade-off — the
+free list is not rolled back, because post-save allocations can overwrite the
+save-time head node's link word).
+**Reason:** rolling back the free list is unsafe in general (a popped head node
+gets overwritten by its new owner); the armed-leak keeps the saved tree's blocks
+allocated forever, which is exactly the COW guarantee the snapshot needs. Restore
+is crash-safe: the whole superblock (root+gen+sum) lands in one blk_write.
+**Found-by:** the first restore demo failed because dir_upd freed the pre-save
+chain after the save (commit message "then frees the old chain") — the free list
+head became the saved root block itself (free=1018 root=1018 in the failure dump).

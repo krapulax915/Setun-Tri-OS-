@@ -8,9 +8,9 @@
 ; ==== TERN PROGRAM ENTRY ====
 tern_main:
     push R7
-    const R1, .Lstr1
+    const R1, Lstr1
     push R1
-    call puts
+    call tern_puts
     pop R1
     const R1, 0
     ret

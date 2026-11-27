@@ -35,7 +35,7 @@ Core numbers / Alapadatok:
 | Page / oldal | 729 trytes / tryte |
 | ISA | 49 opcodes, 4-trit op field, `[op:4\|rd:2\|rs:2\|imm:10]` |
 | Compare / összehasonlítás | three-way, no flags / háromutas, nincs flag-regiszter |
-| Tests / tesztek | 131 green / zöld |
+| Tests / tesztek | 134 green / zöld |
 
 ## Status / Állapot
 
