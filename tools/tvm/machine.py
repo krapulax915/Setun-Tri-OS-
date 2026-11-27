@@ -16,10 +16,13 @@ from tvm.memory import PhysicalMemory, BusError
 from tvm.cpu import CPU, CSR_NUM, CAUSE
 from tvm.mmu import MMU
 from tvm.devices import (Device, Uart, BlockDevice, Rng, PowerDevice, ProfDevice,
+                         Framebuffer,
                          MMIO_BASE, MMIO_SPAN,
                          UART_TX, UART_RX, UART_STAT, BLK_LBA, BLK_BUF, BLK_CMD,
                          BLK_STAT, RNG_VAL, POWER, PROF_CTRL, PROF_ACK,
-                         IRQ_UART, IRQ_BLK)
+                         FB_WIDTH, FB_HEIGHT, FB_STRIDE, FB_FORMAT,
+                         FB_PALETTE, FB_CTRL, FB_FRAME,
+                         IRQ_UART, IRQ_BLK, IRQ_FB)
 
 # MMIO offset -> (device index, register offset) — D-011 map, 3-tryte slots
 REG_MAP = {
@@ -34,6 +37,13 @@ REG_MAP = {
     27: (3, POWER),
     30: (4, PROF_CTRL),
     33: (4, PROF_ACK),
+    36: (5, FB_WIDTH),
+    39: (5, FB_HEIGHT),
+    42: (5, FB_STRIDE),
+    45: (5, FB_FORMAT),
+    48: (5, FB_PALETTE),
+    144: (5, FB_CTRL),
+    147: (5, FB_FRAME),
 }
 
 ROM_SIZE = 6561                 # 9 blocks of 729 trytes
@@ -109,8 +119,9 @@ class Machine:
         self._dev_rng = Rng(self, seed)
         self._dev_power = PowerDevice(self)
         self._dev_prof = ProfDevice(self)
+        self._dev_fb = Framebuffer(self, width=320, height=200, bpp=1)
         self.devices = [self._dev_uart, self._dev_blk, self._dev_rng,
-                        self._dev_power, self._dev_prof]
+                        self._dev_power, self._dev_prof, self._dev_fb]
         self.bus = MmioBus(self.ram, self.devices)
         self.mmu = MMU(self.bus)
         self.cpu = CPU(self.mmu, trap_hook=self._bare_trap)

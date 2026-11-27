@@ -22,6 +22,13 @@ RNG_VAL = 24
 POWER = 27
 PROF_CTRL = 30
 PROF_ACK = 33
+FB_WIDTH = 36
+FB_HEIGHT = 39
+FB_STRIDE = 42
+FB_FORMAT = 45
+FB_PALETTE = 48
+FB_CTRL = 144
+FB_FRAME = 147
 
 STAT_IDLE, STAT_BUSY, STAT_ERR = 0, 1, -1
 
@@ -30,6 +37,7 @@ IRQ_UART = 10 + 1
 IRQ_BLK = 10 + 2
 IRQ_RNG = 10 + 3
 IRQ_PROF = 10 + 4
+IRQ_FB = 10 + 5
 
 
 class Device:
@@ -191,3 +199,97 @@ class BlockDevice(Device):
     def to_bytes(self) -> bytes:
         import pack as packmod
         return packmod.pack_trytes(self.to_trytes())
+
+
+class Framebuffer(Device):
+    """Framebuffer graphics device with MMIO interface."""
+    name = "fb"
+    
+    def __init__(self, machine=None, width=320, height=200, bpp=1):
+        # Support both Framebuffer(width, height, bpp) and Framebuffer(machine, width, height, bpp)
+        if machine is not None and not isinstance(machine, (int, type(None))):
+            # Called as Framebuffer(machine, width, height, bpp)
+            super().__init__(machine)
+        else:
+            # Called as Framebuffer(width, height, bpp) - machine is actually width
+            super().__init__(None)
+            width, height, bpp = machine, width, height
+        self.width = width
+        self.height = height
+        self.bpp = bpp
+        self.frame = bytearray(width * height * max(1, bpp // 8))
+        self.dirty = True
+        self.palette = self._default_palette()
+    
+    def _default_palette(self):
+        pal = []
+        for i in range(256):
+            r = (i & 0xE0) << 16
+            g = (i & 0x1C) << 19
+            b = (i & 0x03) << 22
+            pal.append((r >> 16, g >> 19, b >> 22))
+        return pal
+    
+    def set_pixel(self, x, y, color):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            idx = y * self.width + x
+            if self.bpp == 1:
+                byte_idx = idx // 8
+                bit = idx % 8
+                if color:
+                    self.frame[byte_idx] |= (1 << (7 - bit))
+                else:
+                    self.frame[byte_idx] &= ~(1 << (7 - bit))
+            else:
+                self.frame[idx] = color
+            self.dirty = True
+    
+    def get_pixel(self, x, y):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            idx = y * self.width + x
+            if self.bpp == 1:
+                byte_idx = idx // 8
+                bit = idx % 8
+                return (self.frame[byte_idx] >> (7 - bit)) & 1
+            return self.frame[idx]
+        return 0
+    
+    def fill(self, color):
+        if self.bpp == 1:
+            self.frame = bytearray([0xFF if color else 0x00] * len(self.frame))
+        else:
+            self.frame = bytearray([color] * len(self.frame))
+        self.dirty = True
+    
+    def read_word(self, off):
+        if off == FB_WIDTH:
+            return self.width
+        if off == FB_HEIGHT:
+            return self.height
+        if off == FB_STRIDE:
+            return self.width
+        if off == FB_FORMAT:
+            return self.bpp
+        if off == FB_CTRL:
+            return 1 if self.dirty else 0
+        if off == FB_FRAME:
+            return self._frame_addr()
+        return 0
+    
+    def write_word(self, off, v):
+        if off == FB_CTRL:
+            if v & 1:  # FB_CTRL_DIRTY
+                self.dirty = True
+        elif off >= FB_PALETTE and off < FB_PALETTE + 768:
+            # Palette write (3 bytes per entry)
+            pass
+        self.dirty = True
+    
+    def _frame_addr(self):
+        # Return a virtual address for the frame buffer
+        # In a real implementation, this would be a physical address
+        return id(self.frame)  # Placeholder
+    
+    def to_trytes(self) -> list:
+        # For disk serialization (not typically needed for framebuffer)
+        return [0]
